@@ -23,13 +23,6 @@ class PosType(Enum):
     Short = 2
     Flat = 3
 
-
-class Action(Enum):
-    Buy = 1
-    Sell = 0
-    DoNothing = 2
-
-
 class Book:
     def __init__(self, pos=PosType.Flat, price=0, qty=0, realized_val=0):
         self.pos = pos
@@ -133,6 +126,16 @@ class TradingEnv(gym.Env):
         # Transactions is where we store all of the transactions (enter/exit pairs)
         self.transaction_dim = 13
         self.transactions = np.empty(shape=(0, self.transaction_dim))
+        # Executions
+        # - Time Step
+        # - Action (Buy / Sell)
+        # - Quantity
+        # - Fill Price
+        # - Position Type (Long/Short)
+        # - Position Qty
+        # - Position Avg Price
+        self.executions = np.empty(shape=(0, 7))
+        self.execution_order_reward = 0
         # This will hold temp transaction state while waiting for transaction to be closed
         self.tmp_transaction = np.empty(shape=(0, self.transaction_dim))
         # Book contains position:
@@ -148,6 +151,8 @@ class TradingEnv(gym.Env):
         self.featureList = featureList
         # This holds the maximum drawdown (loss or potential loss) throughout the episode
         self.max_drawdown = 0
+        self.max_accum_reward = 0
+        self.max_accum_reward_low_point = 0
         # This indicates if environment should take profit at a certain target
         self.take_profit = take_profit
         # This indicates if environment should take loss at a certain target
@@ -182,10 +187,6 @@ class TradingEnv(gym.Env):
 
         if load_historic_rewards:
             self.load_episode_rewards()
-
-        # This is used to add commissions to individual step rewars
-        self.add_step_reward_commission = False
-        self.closing_step_reward = 0
 
         ### FROM HERE BELOW BEING ADAPTED FOR GYM
         self.np_random = None
@@ -225,25 +226,6 @@ class TradingEnv(gym.Env):
             self.feature_info, self.price_info, self.scaler = self.set_and_save_scaler(self.featureList,
                                                                                        'scaler.pickle')
             self.max_time_steps = self.get_max_timesteps()
-
-    def get_reward_for_each_step(self):
-
-        # self.tmp_transaction = np.array(
-        # [post_type, in_time_step, last_price, in_price, out_time_step, last_price, out_price, num_time_steps,
-        # pnl, net_pnl, ticks, commission, drawdown])
-
-        ret = self.get_exit_unrlz_value(time_step=self.current_time_step) + self.closing_step_reward
-
-        if self.position_time_step > 0:
-            ret = ret - self.get_exit_unrlz_value(time_step=(self.current_time_step - 1))
-
-        if self.add_step_reward_commission:
-            ret = ret - self.commission_per_order
-            self.add_step_reward_commission = False
-
-        self.closing_step_reward = 0
-
-        return ret
 
     def set_and_save_scaler(self, featureList, scaler_name):
         feature_info, price_info, scaler = to_3D(featureList_=featureList, timesteps=1)
@@ -299,9 +281,12 @@ class TradingEnv(gym.Env):
         self.book = Book(realized_val=self.init_balance)
         self.tmp_transaction = np.empty(shape=(0, self.transaction_dim))
         self.transactions = np.empty(shape=(0, self.transaction_dim))
+        self.executions = np.empty(shape=(0, 7))
         self.last_session_printed = False
         self.session_count = 0
         self.num_print_trans = 0
+        self.max_accum_reward = 0
+        self.max_accum_reward_low_point = 0
         self.state = self.get_state()
         return self.state
 
@@ -433,6 +418,9 @@ class TradingEnv(gym.Env):
     def tmp_trans_start(self, post_type, in_time_step, last_price, in_price):
         self.tmp_transaction = np.array([post_type, in_time_step, last_price, in_price])
 
+    def get_max_accum_loss(self):
+        return self.max_accum_reward - self.max_accum_reward_low_point
+
     def tmp_trans_close(self, out_time_step, last_price, out_price, pnl):
         post_type = self.tmp_transaction[0]
         in_time_step = self.tmp_transaction[1]
@@ -442,6 +430,15 @@ class TradingEnv(gym.Env):
         net_pnl = pnl - commission
         ticks = (out_price - in_price) / self.tick_size
         drawdown = self.max_drawdown
+
+        # Calculate max accumulated reward
+        tot_pnl = self.get_tot_tran_pnl()
+        if tot_pnl > self.max_accum_reward:
+            self.max_accum_reward = tot_pnl
+            self.max_accum_reward_low_point = tot_pnl
+        else:
+            if tot_pnl < self.max_accum_reward_low_point:
+                self.max_accum_reward_low_point = tot_pnl
 
         self.tmp_transaction = np.array(
             [post_type, in_time_step, last_price, in_price, out_time_step, last_price, out_price, num_time_steps,
@@ -465,11 +462,110 @@ class TradingEnv(gym.Env):
     def get_extra_tick(self):
         return 0
 
-    def exit_long(self):
-        # will add commission cost when calculating individual step rewards
-        self.add_step_reward_commission = True
-        self.closing_step_reward = self.get_exit_unrlz_value(self.current_time_step)
+    def add_execution(self, time_step, action, qty, fill_price):
+        # EnterLong() generates OrderAction.Buy
+        # ExitLong() generates OrderAction.Sell
+        # EnterShort() generates OrderAction.SellShort
+        # ExitShort() generates OrderAction.BuyToCover
 
+        # Executions
+        # - Time Step
+        # - Action (Buy / Sell)
+        # - Quantity
+        # - Fill Price
+        # - Position Type (Long/Short)
+        # - Position Qty
+        # - Position Avg Price
+
+        pos_type = action
+        pos_qty = qty
+        pos_avg_price = fill_price
+        if self.executions.shape[0] > 0:
+            # Get Last Position info
+            last_time_step = self.executions[-1,0]
+            last_pos = self.executions[-1, 4]
+            last_pos_qty = self.executions[-1, 5]
+            last_pos_avg_price = self.executions[-1, 6]
+
+            if (action == PosType.Long and last_pos == PosType.Long) or \
+                    (action == PosType.Short and last_pos == PosType.Short):
+                pos_type = PosType.Long
+                pos_qty = last_pos_qty + qty
+                pos_avg_price = (qty*fill_price + last_pos_qty*last_pos_avg_price) / (qty+last_pos_qty)
+            elif action == PosType.Long and last_pos == PosType.Short:
+                if qty>last_pos_qty:
+                    pos_type = PosType.Long
+                    pos_qty = qty - last_pos_qty
+                    pos_avg_price = fill_price
+                elif qty<last_pos_qty:
+                    pos_type = PosType.Short
+                    pos_qty = last_pos_qty - qty
+                    pos_avg_price = last_pos_avg_price
+                else: # qty==last_pos_qty:
+                    pos_type = PosType.Flat
+                    pos_qty = 0
+                    pos_avg_price = 0
+            elif action == PosType.Short and last_pos == PosType.Long:
+                if qty>last_pos_qty:
+                    pos_type = PosType.Short
+                    pos_qty = qty - last_pos_qty
+                    pos_avg_price = fill_price
+                elif qty<last_pos_qty:
+                    pos_type = PosType.Long
+                    pos_qty = last_pos_qty - qty
+                    pos_avg_price = last_pos_avg_price
+                else: # qty==last_pos_qty:
+                    pos_type = PosType.Flat
+                    pos_qty = 0
+                    pos_avg_price = 0
+
+        # Let's make sure we don't have any overlapping positions.
+        assert pos_qty == 1 or pos_qty == 0
+
+        execution = np.array([time_step, action, qty, fill_price, pos_type, pos_qty, pos_avg_price])
+        self.executions = np.vstack([self.executions, execution])
+
+    def get_execution_unrlz_step_value(self):
+        is_last = False
+        i_last = -1
+        if self.executions[i_last, 4] == PosType.Flat and self.executions.shape[0] > 1 and self.executions[i_last, 0] == self.current_time_step:
+            i_last = -2
+            is_last = True
+        last_time_step = self.executions[i_last, 0]
+        last_pos = self.executions[i_last, 4]
+        last_pos_qty = self.executions[i_last, 5]
+        last_pos_avg_price = self.executions[i_last, 6]
+
+        unrlzd_step_value = 0
+        if last_pos is not PosType.Flat:
+            if last_time_step < self.current_time_step:
+                if last_pos == PosType.Long:
+                    unrlzd_step_value += (self.get_current_bid()-self.get_current_bid(time_step=self.current_time_step-1))*last_pos_qty*self.tick_value/self.tick_size
+                elif last_pos == PosType.Short:
+                    unrlzd_step_value += (self.get_current_ask(time_step=self.current_time_step-1)-self.get_current_ask())*last_pos_qty*self.tick_value/self.tick_size
+            else:
+                # charge the commission at the begining of the order
+                unrlzd_step_value += - self.commission_per_order * 2
+                if last_pos == PosType.Long:
+                    unrlzd_step_value += (self.get_current_bid()-last_pos_avg_price)*last_pos_qty*self.tick_value/self.tick_size
+                elif last_pos == PosType.Short:
+                    unrlzd_step_value += (last_pos_avg_price - self.get_current_ask())*last_pos_qty*self.tick_value/self.tick_size
+
+        self.execution_order_reward += unrlzd_step_value
+
+        if is_last:
+            # str1 = "{:.2f}".format(self.execution_order_reward)
+            # str2 = "{:.2f}".format(np.sum(self.transactions[-1:, 9]))
+            # if str1 != str2:
+            #     print("Error detected on step rewards")
+            # print("TimeStep {}, Step Reward: {:.2f}, Pnl Rewards {:.2f}".format(self.current_time_step,
+            #                                                                     self.execution_order_reward,
+            #                                                                     np.sum(self.transactions[-1:, 9])))
+            self.execution_order_reward = 0
+
+        return unrlzd_step_value
+
+    def exit_long(self):
         # Update the realized value for 1 share
         new_qty = self.get_book_qty() - 1
         new_price_val = self.get_current_bid()  # - self.get_extra_tick()
@@ -483,6 +579,9 @@ class TradingEnv(gym.Env):
         # Close temp transaction and add to transaction history
         self.tmp_trans_close(self.current_time_step, self.get_current_price(), self.get_current_bid(),
                              new_unr_val)
+
+        # Add execution transactions.
+        self.add_execution(self.current_time_step, PosType.Short, 1, self.get_current_bid())
 
     def enter_short(self):
         # Update the realized value for 1 share
@@ -502,14 +601,10 @@ class TradingEnv(gym.Env):
         # set drawdown to 0 when entering transaction
         self.max_drawdown = 0
 
-        # will add commission cost when calculating individual step rewards
-        self.add_step_reward_commission = True
+        # Add execution transactions.
+        self.add_execution(self.current_time_step, PosType.Short, 1, self.get_current_bid())
 
     def exit_short(self):
-        # will add commission cost when calculating individual step rewards
-        self.add_step_reward_commission = True
-        self.closing_step_reward = self.get_exit_unrlz_value(self.current_time_step)
-
         # Update the realized value for 1 share
         new_qty = self.get_book_qty() - 1
         new_price_val = self.get_current_ask()  # + self.get_extra_tick()
@@ -524,6 +619,9 @@ class TradingEnv(gym.Env):
         # Close temp transaction and add to transaction history
         self.tmp_trans_close(self.current_time_step, self.get_current_price(), self.get_current_ask(),
                              new_unr_val)
+
+        # Add execution transactions.
+        self.add_execution(self.current_time_step, PosType.Long, 1, self.get_current_ask())
 
     def enter_long(self):
         # Update the realized value for 1 share
@@ -543,8 +641,8 @@ class TradingEnv(gym.Env):
         # set drawdown to 0 when entering transaction
         self.max_drawdown = 0
 
-        # will add commission cost when calculating individual step rewards
-        self.add_step_reward_commission = True
+        # Add execution transactions.
+        self.add_execution(self.current_time_step, PosType.Long, 1, self.get_current_ask())
 
     def print_transaction_summary(self, session_expired):
         try:
@@ -938,7 +1036,7 @@ class TradingEnv(gym.Env):
             if self.is_same_entry_as_previous(PosType.Long):
                 self.incentives += self.same_entry_penalty
 
-        elif (action == 1 and self.is_current_pos_short() and can_exit) or exit_pos:  # EXIT SHORT
+        elif (action == 1 and self.is_current_pos_short() and can_exit) or (self.is_current_pos_short() and exit_pos):  # EXIT SHORT
             self.exit_short()
             tran_closed = True
         elif action == 0 and self.is_current_pos_flat() and (not session_expired):  # ENTER SHORT
@@ -946,7 +1044,7 @@ class TradingEnv(gym.Env):
             self.tran_unrlz_value = []
             if self.is_same_entry_as_previous(PosType.Short):
                 self.incentives += self.same_entry_penalty
-        elif (action == 0 and self.is_current_pos_long() and can_exit) or exit_pos:  # EXIT LONG
+        elif (action == 0 and self.is_current_pos_long() and can_exit) or (self.is_current_pos_long() and exit_pos):  # EXIT LONG
             self.exit_long()
             tran_closed = True
 
@@ -967,7 +1065,7 @@ class TradingEnv(gym.Env):
 
         # Calculate exit reward for each step
         if self.reward_for_each_step:
-            reward = self.get_reward_for_each_step()
+            reward = self.get_execution_unrlz_step_value()
 
         # INCENTIVES AND PENALTIES (NOT BEING USED)
         # if self.inactive_time_step > 100:
