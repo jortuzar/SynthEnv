@@ -1,35 +1,50 @@
-from SynthTradingEnv.SynthCommons import to_3D, load_json
+from SynthTradingEnv.SynthCommons import norm_features, load_json, load_npz
 import numpy as np
+from scipy import stats
 import pickle
+import math
 import matplotlib.pyplot as plt
-from enum import Enum
-from random import randint
+from random import randint, choice
 import gym
 from gym import spaces
 from gym.utils import seeding
 from deprecated import deprecated
+import curses
+from curseXcel import Table
+import torch
+import logging
+
+# FOR USE WITH CUPY
+# mempool = np.get_default_memory_pool()
+# with np.cuda.Device(0):
+#     mempool.set_limit(size=10*2*1024**3)  # 20 GiB
 
 
-# THIS HAS 3 ACTIONS BUY/SELL/HOLD
+# POSITION TYPES
+POSTYPE_LONG = 1
+POSTYPE_SHORT = 2
+POSTYPE_FLAT = 3
 
-class PriceType(Enum):
-    Last = 1
-    Bid = 2
-    Ask = 3
+# ORDER ACTIONS
+# EnterLong() generates OrderAction.Buy
+# ExitLong() generates OrderAction.Sell
+# EnterShort() generates OrderAction.SellShort
+# ExitShort() generates OrderAction.BuyToCover
+ORDER_ACTION_BUY = 1
+ORDER_ACTION_SELL = 2
+ORDER_ACTION_SELL_SHORT = 3
+ORDER_ACTION_BUY_TO_COVER = 4
 
-
-class PosType(Enum):
-    Long = 1
-    Short = 2
-    Flat = 3
-
-class Book:
-    def __init__(self, pos=PosType.Flat, price=0, qty=0, realized_val=0):
-        self.pos = pos
-        self.price = price
-        self.qty = qty
-        self.realized_val = realized_val
-        self.previous_realized_val = realized_val
+# ORDER TYPES
+# OrderType.Limit
+# OrderType.Market
+# OrderType.MIT
+# OrderType.StopMarket
+# OrderType.StopLimit
+ORDER_TYPE_LIMIT = 1
+ORDER_TYPE_MARKET = 2
+ORDER_TYPE_STOP_MARKET = 3
+ORDER_TYPE_STOP_LIMIT = 4
 
 
 class TradingEnv(gym.Env):
@@ -38,32 +53,48 @@ class TradingEnv(gym.Env):
 
     def __init__(self,
                  featureList=None,
+                 min_margin=None,
+                 position_max_qty=10,
                  time_steps=1,
                  start_time_step=0,
                  end_time_step=None,
-                 init_balance=100000,
                  tick_size=0.005,
                  tick_value=25,
                  commission_per_order=2.31,
                  take_profit=1e10,
                  take_loss=1e10,
+                 exit_net_drawdown=None,
                  max_time_steps=0,
-                 shuffle=False,
+                 shuffle_per_tran=False,
+                 shuffle_per_tran_tt_done=None,
                  normalize_return=True,
-                 ff_on_loss=False,
-                 min_ff_loss=500,
                  train_side=None,
                  skip_steps=1,
                  skip_incentive=0,
                  same_entry_penalty=-1000,
                  reward_for_each_step=False,
+                 mask_min_steps=False,
+                 mask_pos_risk_reward=False,
+                 mask_pos_risk_reward_risk=1500,
+                 mask_pos_risk_reward_reward=250,
+                 mask_flip_flop=False,
+                 mask_flip_on_previous_loss=False,
+                 mask_wall_value=1000,
                  data_file_path='C:/Users/jortu/Documents/1Syntheticks-AI/',
                  data_file_name='SI-09-20-FEATURELIST.json',
+                 output_path='C:/Users/jortu/Documents/1Syntheticks-AI/',
                  load_historic_rewards=False):
         super(TradingEnv, self).__init__()
 
         # Environment Name
-        self.env = "Sythetick Trading Env 1.0"
+        self.env = "Sytheticks Trading Env 1.0"
+
+        self.epsilon: float = 1e-6
+
+        self.device = torch.device(
+            "cuda:0" if torch.cuda.is_available() else "cpu"
+        )
+        # print(self.device)
 
         # this will return the difference gained between step i-1 and step i. That way
         # true returns are fed back to Agent on each step.
@@ -72,11 +103,6 @@ class TradingEnv(gym.Env):
         # a negative return.
         self.same_entry_penalty = same_entry_penalty
         # make returns between 0 - 1
-        self.normalize_return = normalize_return
-        # if we want to fast forward to a winning or min_ff_loss state
-        self.ff_on_loss = ff_on_loss
-        # used in conjunction with ff_on_loss
-        self.min_ff_loss = min_ff_loss
         # 0 is short, 1 is long
         self.train_side = train_side
         # used when skipping while training a single side
@@ -88,12 +114,26 @@ class TradingEnv(gym.Env):
         self.data_file_name = data_file_name
         self.data_file_path = data_file_path
         self.data_file_path_name = self.data_file_path + self.data_file_name
+        self.output_path = output_path
 
         # Shuffle the starting point
-        self.shuffle = shuffle
+        self.shuffle_per_tran = shuffle_per_tran
+        self.shuffle_per_tran_trigger = False
+        self.shuffle_per_tran_tt_done = shuffle_per_tran_tt_done
+        self.shuffle_per_tran_tt_counter = 0
+        self.shuffle_per_tran_step_list = []
 
+        # Used for getting valid order_action masks
+        self.mask_min_steps = mask_min_steps
+        self.mask_pos_risk_reward = mask_pos_risk_reward
+        self.mask_pos_risk_reward_risk = mask_pos_risk_reward_risk
+        self.mask_pos_risk_reward_reward = mask_pos_risk_reward_reward
+        self.mask_pos_risk_reward_target_hit = False
+        self.mask_flip_flop = mask_flip_flop
+        self.mask_flip_on_previous_loss = mask_flip_on_previous_loss
+        self.mask_wall_value = mask_wall_value
         # This is the initial money balance with we start
-        self.init_balance = init_balance
+        self.balance = 0
         # This is used in normalization of featureList. It will create a "Window" of n time_steps for each
         # row. This is inherited from LSTM, but not really used here.
         self.time_steps = time_steps
@@ -102,14 +142,13 @@ class TradingEnv(gym.Env):
         self.end_time_step = end_time_step
         # Keeps track of the current Time Step we are in at any moment
         self.current_time_step = start_time_step
-        # The min amount that a futures instuments moves up and down. Example 0.005 in SI (silver) futures
+        # The min amount that a futures instruments moves up and down. Example 0.005 in SI (silver) futures
         self.tick_size = tick_size
         # What 1 tick is valued at in money. Example $25.00 for 1 tick in SI (silver) futures
         self.tick_value = tick_value
+        self.point_value = tick_value / self.tick_size
         # Value of the commission charged per order per side (enter or exit) by the futures broker
         self.commission_per_order = commission_per_order
-        # Max amount of orders that can be placed in one direction at a time. For now we are only using 1.
-        self.max_per_side_qty = 1
         # Scaler to be stored for normalizing live market data feed.
         self.scaler = None
         # stores how many current time steps of inactivity
@@ -120,13 +159,29 @@ class TradingEnv(gym.Env):
         self.incentives = 0
         # This is the min $ margin that is needed to be maintained in an account for a certain instrument
         # SI for example.
-        self.min_margin = 15000
+        self.min_margin = min_margin
         # This hold previous state. Not currently being used though.
         self.previous_state = []
         # Transactions is where we store all of the transactions (enter/exit pairs)
         self.transaction_dim = 13
+        self.transaction_added = False
+        # TRANSACTIONS:
+        # 0 - pos_type
+        # 1 - in_time_step
+        # 2 - last_price - --> NOT USED
+        # 3 - in_price
+        # 4 - out_time_step
+        # 5 - last_price - --> NOT USED
+        # 6 - out_price
+        # 7 - num_time_steps
+        # 8 - pnl - --> NOT USED
+        # 9 - net_pnl
+        # 10 - ticks
+        # 11 - commissions
+        # 12 - drawdown
         self.transactions = np.empty(shape=(0, self.transaction_dim))
-        # Executions
+
+        # Executions: Note that each execution updates the position at the very end of the array.
         # - Time Step
         # - Action (Buy / Sell)
         # - Quantity
@@ -136,23 +191,36 @@ class TradingEnv(gym.Env):
         # - Position Avg Price
         self.executions = np.empty(shape=(0, 7))
         self.execution_order_reward = 0
-        # This will hold temp transaction state while waiting for transaction to be closed
-        self.tmp_transaction = np.empty(shape=(0, self.transaction_dim))
-        # Book contains position:
-        # If you keep stacking a position you need to get average
-        # If you settle part or all of the position you need to
-        # update the realized position. Also update realized every
-        # time you buy/sell since you incur in commission.
-        # BOOK: L/S, price, qty, realized value
-        self.book = Book(realized_val=self.init_balance)
+        self.position_max_qty = position_max_qty
+
+        self.reward_total = 0
+        self.reward_steps = np.array([[0, 0]])
+
+        # ORDER QUEUE
+        # - Order Action
+        # - Order Type
+        # - Order Price
+        # - Order Qty
+        # - In Time Step
+        # - Is Live Until Canceled (1 / 0). If 0 then order_queue_ts_alive
+        self.order_queue = np.empty(shape=(0, 6))
+        self.order_queue_is_market = 1
+        self.order_queue_ts_alive = 100
+
         # This contains all of the feature data. First columns include price (last, bid, ask) and
         # how many seconds left to terminate trading session. This data will be extracted form featureList.
         # The clean normalized features are included in feature_info
         self.featureList = featureList
+        # This is the drawdown accumulated within a transaction by the difference of max exit_unrlz and current_price
+        self.exit_net_drawdown = exit_net_drawdown
+        self.max_exit_unrlz = 0
         # This holds the maximum drawdown (loss or potential loss) throughout the episode
         self.max_drawdown = 0
         self.max_accum_reward = 0
         self.max_accum_reward_low_point = 0
+        self.max_accum_reward_start = 0
+        self.max_accum_reward_low_point_end = 0
+        self.max_accum_losses = np.array([[0, 0, 0, 0]])
         # This indicates if environment should take profit at a certain target
         self.take_profit = take_profit
         # This indicates if environment should take loss at a certain target
@@ -167,18 +235,9 @@ class TradingEnv(gym.Env):
         # Keeps the info regarding whether the state is done or not.
         self.done = False
 
-        # Fast Forward mode used when forwarding trough min loss states. This can be used when we don't
-        # want to exit a position until we have hit a min threshold of $XXX amount.
-        self.ff = False
-        self.min_ff_loss = 500
-
         # If we want to normalize returns sent back to (-1,+1), then we need to divide by a # that is the MAX expected
         # return of a single transactions. Don't expect clipping to -1, 1 would produce the same effect.
         self.max_return_norm = 20000
-
-        # Used to calculate discounted value return per transaction
-        self.tran_unrlz_value = []
-        self.prev_unrlz_value = 0
 
         self.episode_rewards = []
 
@@ -188,26 +247,32 @@ class TradingEnv(gym.Env):
         if load_historic_rewards:
             self.load_episode_rewards()
 
-        ### FROM HERE BELOW BEING ADAPTED FOR GYM
+        # FROM HERE BELOW BEING ADAPTED FOR GYM
         self.np_random = None
 
         # Load Feature List
-        self.load_feature_list(file_path=self.data_file_path_name)
+        if self.featureList is None:
+            self.load_feature_list(file_path=self.data_file_path_name)
+
         if self.end_time_step is not None and self.end_time_step > self.start_time_step:
             self.featureList = self.featureList[0:self.end_time_step]
 
         self.num_featureList_features = self.featureList.shape[1]
-        self.num_feature_headers = 3
-        self.num_extra_features = 1
+        # Features included in the front of each row.
+        # Last Price, Bid, Ask, Seconds left in session and Date Time.
+        self.num_feature_headers = 5
+        # Features added by get_state()
+        self.num_extra_features = 4
         self.num_features = self.num_featureList_features + self.num_extra_features - self.num_feature_headers
 
         # 0 -> short
         # 1 -> long
-        # 2 -> do nothing
-        self.num_actions = 2
+        # 2 -> close position
+        # 3 -> do nothing
+        self.num_actions = 4
 
         # ****** Gym specific ******
-        self.name = "Synthetick Trading Environment"
+        self.name = "Syntheticks Trading Environment"
         self.action_space = spaces.Discrete(self.num_actions)
         max_val = np.finfo(np.float32).max
         high = np.full((self.num_features,), max_val)
@@ -220,17 +285,229 @@ class TradingEnv(gym.Env):
         self.unwrapped.trials = 100
         self._max_episode_steps = float('inf')
 
-        ### FROM HERE UP BEING ADAPTED FOR GYM
+        # FROM HERE UP BEING ADAPTED FOR GYM
 
         if self.featureList is not None and self.featureList.shape[1]:
             self.feature_info, self.price_info, self.scaler = self.set_and_save_scaler(self.featureList,
                                                                                        'scaler.pickle')
             self.max_time_steps = self.get_max_timesteps()
+            assert self.feature_info.shape[1] == self.num_features
+
+        # SETUP CURSES FOR OUTPUT DISPLAY
+
+        # self.stdscr = curses.initscr
+        # curses.noecho()
+        # curses.cbreak()
+        # self.stdscr.keypad(False)
+        # curses.wrapper(self.main_curses)
+        # curses.nocbreak()
+        # stdscr.keypad(False)
+        # curses.echo()
+        # curses.endwin()
+
+        # rows = 10
+        # cols = 20
+        # cell = 5
+        # width = 20
+        # height = 30
+        # col_names = True
+        # spacing = 1
+        # self.table = Table(self.stdscr, rows, cols, cell, width, height, col_names=col_names, spacing=spacing)  # the last two are optional
+        # self.set_table_col_names()
+
+    # def main_curses(stdscr):
+    #     x = 0
+    #     while (x != 'q'):
+    #         stdscr.refresh()
+    #         x = stdscr.getkey()
+
+    def validate_price_info(self):
+        bid_count = 0
+        ask_count = 0
+        sum_bids = 0
+        sum_asks = 0
+        adj = 2
+        print("Validating BID/ASK tick differences...")
+        logging.debug("Validating BID/ASK tick differences...")
+        for i in range(self.price_info.shape[0]):
+            bid_ticks = abs(self.price_info[i, 0] - self.price_info[i, 1]) / self.tick_size
+            ask_ticks = abs(self.price_info[i, 0] - self.price_info[i, 2]) / self.tick_size
+            if bid_ticks > adj:
+                self.price_info[i, 1] = self.price_info[i, 0] - adj * self.tick_size
+                sum_bids += bid_ticks
+                bid_count += 1
+                # print(abs(self.price_info[i, 0] - self.price_info[i, 1]) / self.tick_size)
+            if ask_ticks > adj:
+                self.price_info[i, 2] = self.price_info[i, 0] + adj * self.tick_size
+                sum_asks += ask_ticks
+                ask_count += 1
+                # print(abs(self.price_info[i, 0] - self.price_info[i, 2]) / self.tick_size)
+        print("bid_count {}".format(bid_count))
+        logging.debug("bid_count {}".format(bid_count))
+        print("ask_count {}".format(ask_count))
+        logging.debug("ask_count {}".format(ask_count))
+        if bid_count > 0:
+            print("bid avg {}".format(sum_bids / bid_count))
+            logging.debug("bid avg {}".format(sum_bids / bid_count))
+        if ask_count > 0:
+            print("ask avg {}".format(sum_asks / ask_count))
+            logging.debug("ask avg {}".format(sum_asks / ask_count))
+
+    def is_state_pos_flat(self, state):
+        if state[0] == 0.5:
+            return True
+        else:
+            return False
+
+    def is_state_pos_long(self, state):
+        if state[0] == 1:
+            return True
+        else:
+            return False
+
+    def is_state_pos_short(self, state):
+        if state[0] == 0:
+            return True
+        else:
+            return False
+
+    def is_state_at_max_qty(self, state):
+        if state[0] != 0.5 and state[1] == 1:
+            return True
+        else:
+            return False
+
+    def get_valid_vector_mask(self):
+        # POSSIBLE ACTIONS
+        # 0 => short
+        # 1 => long
+        # 2 => close position
+        # 3 => do nothing or next step
+
+        valid_mask = np.array([1, 1, 1, 1])
+
+        assert(not self.is_current_pos_short())
+
+        # len(self.episode_rewards)
+        if self.is_current_pos_flat():
+            valid_mask = np.array([0, 1, 0, 1])
+        elif self.is_current_pos_long() and self.get_current_pos_qty() == self.position_max_qty:
+            valid_mask = np.array([1, 0, 1, 1])
+        elif self.is_current_pos_short() and self.get_current_pos_qty() == self.position_max_qty:
+            valid_mask = np.array([0, 1, 1, 1])
+
+        return valid_mask
+
+    def get_valid_mask(self):
+        assert(not self.is_current_pos_short())
+        valid_mask = self.get_valid_vector_mask()
+        valid_mask = valid_mask.astype(bool)
+        valid_mask = np.invert(valid_mask)
+        valid_mask = torch.from_numpy(valid_mask).to(self.device)
+
+        return valid_mask
+
+    def get_valid_vector_mask_probs(self):
+        valid_mask = self.get_valid_vector_mask()
+        tot = np.sum(valid_mask)
+        ret = []
+        assert (tot > 0)
+
+        if valid_mask[1] > 0:
+            prob_long = 0.99
+            probs = (1 - prob_long) / (tot - 1)
+            valid_mask = valid_mask * probs
+            valid_mask[1] = prob_long
+            ret = valid_mask
+        elif self.is_current_pos_long() and valid_mask[1] == 0 and valid_mask[3] == 1:
+            prob_do_nothing = 0.99
+            probs = (1 - prob_do_nothing) / (tot - 1)
+            valid_mask = valid_mask * probs
+            valid_mask[3] = prob_do_nothing
+            ret = valid_mask
+        else:
+            ret = valid_mask / tot
+
+        return ret
+
+    # def get_valid_boolean_mask(self, next_states=None):
+    #     # POSSIBLE ACTIONS
+    #     # 0 => short
+    #     # 1 => long
+    #     # 2 => close position
+    #     # 3 => do nothing or next step
+    #
+    #     if next_states is None:
+    #         valid_mask = torch.tensor([False, False, False, False]).to(self.device)
+    #         if self.is_current_pos_flat():
+    #             valid_mask = torch.tensor([False, False, True, True]).to(self.device)
+    #         elif self.is_current_pos_long() and self.get_current_pos_qty() == self.position_max_qty:
+    #             valid_mask = torch.tensor([False, True, False, False]).to(self.device)
+    #         elif self.is_current_pos_short() and self.get_current_pos_qty() == self.position_max_qty:
+    #             valid_mask = torch.tensor([True, False, False, False]).to(self.device)
+    #
+    #         return valid_mask
+    #     else:
+    #         # STATE:
+    #         # 0. pos -> 0 0.5 1
+    #         # 1. qty -> [self.get_current_pos_qty() / self.position_max_qty]
+    #         # 2. wall
+    #         # 3. ticks
+    #         # 4. features
+    #         # valid_mask_tensor = None
+    #         # batch_size = next_states.shape[0]
+    #         #
+    #         # for i in range(batch_size):
+    #         #     valid_mask = torch.tensor([[False, False, False, False]], device=self.device)
+    #         #
+    #         #     if self.is_state_pos_flat(next_states[i]):
+    #         #         valid_mask = torch.tensor([[False, False, True, True]], device=self.device)
+    #         #     elif self.is_state_pos_long(next_states[i]) and self.is_state_at_max_qty(next_states[i]):
+    #         #         valid_mask = torch.tensor([[False, True, False, False]], device=self.device)
+    #         #     elif self.is_state_pos_short(next_states[i]) and self.is_state_at_max_qty(next_states[i]):
+    #         #         valid_mask = torch.tensor([[True, False, False, False]], device=self.device)
+    #         #
+    #         #     if valid_mask_tensor is None:
+    #         #         valid_mask_tensor = valid_mask
+    #         #     else:
+    #         #         valid_mask_tensor = torch.cat((valid_mask_tensor, valid_mask), dim=0)
+    #
+    #         valid_mask_tensor = np.empty(shape=(0, 4), dtype=bool)
+    #         batch_size = next_states.shape[0]
+    #
+    #         for i in range(batch_size):
+    #             valid_mask = np.array([False, False, False, False])
+    #
+    #             if self.is_state_pos_flat(next_states[i]):
+    #                 valid_mask = np.array([False, False, True, True])
+    #             elif self.is_state_pos_long(next_states[i]) and self.is_state_at_max_qty(next_states[i]):
+    #                 valid_mask = np.array([False, True, False, False])
+    #             elif self.is_state_pos_short(next_states[i]) and self.is_state_at_max_qty(next_states[i]):
+    #                 valid_mask = np.array([True, False, False, False])
+    #
+    #             valid_mask_tensor = np.vstack((valid_mask_tensor, valid_mask))
+    #
+    #         return torch.from_numpy(valid_mask_tensor).to(device=self.device)
+
+    # def is_action_valid(self, action):
+    #     mask = self.get_valid_binary_mask()
+    #     if mask[action].detach().cpu().numpy() == 1:
+    #         return True
+    #     else:
+    #         return False
 
     def set_and_save_scaler(self, featureList, scaler_name):
-        feature_info, price_info, scaler = to_3D(featureList_=featureList, timesteps=1)
-        pickle.dump(self.scaler, open(scaler_name, 'wb'))
+        feature_info, price_info, scaler = norm_features(features=featureList, n_label_cols=self.num_feature_headers)
+        pickle.dump(scaler, open(self.output_path + scaler_name, 'wb'))
         return feature_info, price_info, scaler
+
+    def set_scaler_and_transform_features(self, scaler_name):
+        pickle_file = open(self.output_path + scaler_name, 'rb')
+        self.scaler = pickle.load(pickle_file)
+        pickle_file.close()
+        feature_info, price_info, scaler = norm_features(features=self.featureList, n_label_cols=self.num_feature_headers, test_scaler=self.scaler)
+        self.feature_info = feature_info
+        self.price_info = price_info
 
     def load_scaler(self, path):
         self.scaler = pickle.load(open(path, 'rb'))
@@ -239,8 +516,11 @@ class TradingEnv(gym.Env):
         return self.np_random.randint(self.num_actions)
 
     def load_feature_list(self, file_path=None):
-        is_zip = file_path.find('.zip') >= 0
-        self.featureList = load_json(file_path, is_zip)
+        if file_path.find('.zip') >= 0 or file_path.find('.json') >= 0:
+            is_zip = file_path.find('.zip') >= 0
+            self.featureList = load_json(file_path, is_zip)
+        elif file_path.find('.npz') >= 0:
+            self.featureList = load_npz(file_path)
 
     def load_episode_rewards(self):
         if len(self.episode_rewards) == 0:
@@ -248,9 +528,10 @@ class TradingEnv(gym.Env):
                 self.episode_rewards = pickle.load(open(self.data_file_path + '1ep_rewards.pickle', 'rb'))
             except:
                 print('Episode rewards file not found...')
+                logging.debug('Episode rewards file not found...')
 
     def save_episode_rewards(self):
-        with open(self.data_file_path + '1ep_rewards.pickle', 'wb') as handle:
+        with open(self.output_path + '1ep_rewards.pickle', 'wb') as handle:
             pickle.dump(self.episode_rewards, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     def seed(self, seed=None):
@@ -273,20 +554,25 @@ class TradingEnv(gym.Env):
         return self.feature_info.shape[1] + 2
 
     def reset(self):
+        self.done = False
         self.current_time_step = self.start_time_step
-        if self.shuffle:
-            start = 0
-            end = int(self.feature_info.shape[0] * 0.75)
-            self.current_time_step = randint(start, end)
-        self.book = Book(realized_val=self.init_balance)
-        self.tmp_transaction = np.empty(shape=(0, self.transaction_dim))
+        self.balance = 0
+        self.reward_total = 0
+        if self.shuffle_per_tran:
+            self.current_time_step = self.get_shuffle_per_tran_current_time_step()
+        self.shuffle_per_tran_tt_counter = 0
         self.transactions = np.empty(shape=(0, self.transaction_dim))
         self.executions = np.empty(shape=(0, 7))
+        self.order_queue = np.empty(shape=(0, 6))
+        self.reward_steps = np.array([[0, 0]])
         self.last_session_printed = False
         self.session_count = 0
         self.num_print_trans = 0
         self.max_accum_reward = 0
         self.max_accum_reward_low_point = 0
+        self.max_accum_reward_start = 0
+        self.max_accum_reward_low_point_end = 0
+        self.max_accum_losses = np.array([[0, 0, 0, 0]])
         self.state = self.get_state()
         return self.state
 
@@ -305,67 +591,48 @@ class TradingEnv(gym.Env):
             time_step = self.current_time_step
         return self.price_info[time_step][2]
 
-    def get_current_pos(self):
-        return self.book.pos
-
     def is_current_pos_long(self):
-        return self.book.pos == PosType.Long
+        return self.get_current_pos_type() == POSTYPE_LONG
 
     def is_current_pos_short(self):
-        return self.book.pos == PosType.Short
+        return self.get_current_pos_type() == POSTYPE_SHORT
 
     def is_current_pos_flat(self):
-        return self.book.pos == PosType.Flat
+        return self.get_current_pos_type() == POSTYPE_FLAT
 
-    def set_book_pos(self, pos):
-        self.book.pos = pos
+    def get_current_pos_type(self):
+        last_pos = POSTYPE_FLAT
+        if self.executions.shape[0] > 0:
+            last_pos = self.executions[-1, 4]
+        return last_pos
 
-    def get_book_price_total(self):
-        return self.book.price * self.book.qty
+    def get_current_pos_qty(self):
+        last_pos_qty = 0
+        if self.executions.shape[0] > 0:
+            last_pos_qty = self.executions[-1, 5]
+        return last_pos_qty
 
-    def get_book_price(self):
-        return self.book.price
+    def get_current_pos_price(self):
+        last_pos_price = 0
+        if self.executions.shape[0] > 0:
+            last_pos_price = self.executions[-1, 6]
+        return last_pos_price
 
-    def set_book_price(self, price):
-        self.book.price = price
-
-    def get_book_qty(self):
-        return self.book.qty
-
-    def set_book_qty(self, qty):
-        self.book.qty = qty
-
-    def get_book_realized_value(self):
-        return self.book.realized_val
-
-    def set_book_realized_value(self, value):
-        self.book.previous_realized_val = self.book.realized_val
-        self.book.realized_val = value
-
-    def get_book_unrealized_value(self, price):
-        qty = self.get_book_qty()
-        diff_price = 0
-        if self.book.pos == PosType.Long:
-            diff_price = price - self.get_book_price()
-        elif self.book.pos == PosType.Short:
-            diff_price = self.get_book_price() - price
-
-        unr_value = diff_price * qty * self.tick_value / self.tick_size
-        return unr_value
+    def get_current_pos_ts(self):
+        last_time_step = 0
+        if self.executions.shape[0] > 0:
+            last_time_step = self.executions[-1, 0]
+        return last_time_step
 
     def is_margin_call(self):
-        return self.get_book_realized_value() + self.get_book_unrealized_value(
-            self.get_current_price()) - self.min_margin <= 0
+        if self.min_margin is not None:
+            return self.get_realized_balance() + self.get_gross_unrealized_value() - self.min_margin <= 0
+        else:
+            return False
 
-    def update_book(self, pos, price, qty, realized_val):
-        self.set_book_pos(pos)
-        self.set_book_price(price)
-        self.set_book_qty(qty)
-        self.set_book_realized_value(realized_val)
+    def get_state(self, wall=0):
 
-    def get_state(self):
         # *********** MODIFY self.num_extra_features = 1
-
         # POSITION
         # First element of the state needs to be the position state.
         # This can be useful to filter valid actions
@@ -379,17 +646,37 @@ class TradingEnv(gym.Env):
             position = 0
         state = [position / 1]  # Position Time Steps
 
+        # POSITION QTY
+        state = np.append(state, [self.get_current_pos_qty() / self.position_max_qty])
+
+        # If we hit a wall 1
+        # else it is 0
+        state = np.append(state, [wall])
+
+        # State for when we are at cutoff. Network should know that there are no possible transactions
+        # when session is closed
+        # senssion_ended = 0
+        # if self.featureList[self.current_time_step][3] <= 1:
+        #     senssion_ended = 1
+        # state = np.append(state, [senssion_ended])
+
         # ADD SENSE OF EPISODE CULMINATION FEATURE. THIS CAN BE TIME STEPS FINISHING UP OR BALANCE
         # FINISHING UP. SINCE BALANCE IS MORE TRANSFERABLE TO REAL TIME, THEN LET'S USE THAT.
         # TRY TO USE ENOUGH $ TO GET THROUGH THE COMPLETE TIME STEP SERIES ON FIRST GO.
         # state = np.append(state, [(self.max_time_steps - self.current_time_step) / self.max_time_steps])
         # REALIZED
-        # realized = self.get_book_realized_value()
+        # realized = self.get_realized_balance()
         # state = np.append(state, [realized / self.init_balance])  # Unrealized
 
         # UNREALIZED
-        # unr = self.get_exit_unrlz_value()
-        # state = np.append(state, [unr / self.init_balance])  # Unrealized
+        # unr = (self.get_exit_unrlz_value() / self.tick_value) / 500
+        # state = np.append(state, [unr])  # self.init_balance])  # Unrealized
+        # Get Ticks away instea of unrlz when using multiple QTY
+        ticks = self.get_exit_ticks_away()
+        min_val = -500
+        max_val = 500
+        ticks = (ticks - min_val) / (max_val - min_val)
+        state = np.append(state, [ticks])  # self.init_balance])  # Unrealized
 
         # LAST POSITION RETURN. This can help the algorithm not enter same consecutive
         # positions, especially if last position had a negative return.
@@ -408,61 +695,194 @@ class TradingEnv(gym.Env):
         # l_votes, s_votes = self.enter_action_votes()
         # state = np.append(state, [l_votes])  # Inactive Time Steps
 
-        # FEATURES
+        # Add regular FEATURES
         self.state = np.append(state, self.feature_info[self.current_time_step])
 
         self.previous_state = self.state
 
         return self.state
 
-    def tmp_trans_start(self, post_type, in_time_step, last_price, in_price):
-        self.tmp_transaction = np.array([post_type, in_time_step, last_price, in_price])
-
     def get_max_accum_loss(self):
-        return self.max_accum_reward - self.max_accum_reward_low_point
+        max_accum_loss = self.max_accum_losses[np.argmax(self.max_accum_losses[:, 0] - self.max_accum_losses[:, 2])]
+        return max_accum_loss[0] - max_accum_loss[2], max_accum_loss[1], max_accum_loss[3]
 
-    def tmp_trans_close(self, out_time_step, last_price, out_price, pnl):
-        post_type = self.tmp_transaction[0]
-        in_time_step = self.tmp_transaction[1]
-        in_price = self.tmp_transaction[3]
-        num_time_steps = out_time_step - in_time_step
-        commission = 2 * self.commission_per_order
-        net_pnl = pnl - commission
-        ticks = (out_price - in_price) / self.tick_size
-        drawdown = self.max_drawdown
+    def submit_order(self, action=None, qty=1):
+        # POSSIBLE ACTIONS
+        # 0 => short
+        # 1 => long
+        # 2 => close position
+        # 3 => do nothing or next step
+        if action > 2:
+            return
 
-        # Calculate max accumulated reward
-        tot_pnl = self.get_tot_tran_pnl()
-        if tot_pnl > self.max_accum_reward:
-            self.max_accum_reward = tot_pnl
-            self.max_accum_reward_low_point = tot_pnl
+        # ORDER QUEUE
+        # - Order Action
+        # - Order Type
+        # - Order Price
+        # - Order Qty
+        # - In Time Step
+        # - Is Live Until Canceled (1 / 0). If 0 then order_queue_ts_alive
+
+        # ORDER ACTIONS
+        # EnterLong() generates OrderAction.Buy
+        # ExitLong() generates OrderAction.Sell
+        # EnterShort() generates OrderAction.SellShort
+        # ExitShort() generates OrderAction.BuyToCover
+        # ORDER_ACTION_BUY = 1
+        # ORDER_ACTION_SELL = 2
+        # ORDER_ACTION_SELL_SHORT = 3
+        # ORDER_ACTION_BUY_TO_COVER = 4
+
+        # ORDER TYPES
+        # OrderType.Limit
+        # OrderType.Market
+        # OrderType.MIT
+        # OrderType.StopMarket
+        # OrderType.StopLimit
+        # ORDER_TYPE_LIMIT = 1
+        # ORDER_TYPE_MARKET = 2
+        # ORDER_TYPE_STOP_MARKET = 3
+        # ORDER_TYPE_STOP_LIMIT = 4
+
+        order_action = 0
+        order_type = 0
+        order_price = 0
+        order_qty = 0
+        order_ts = self.current_time_step
+        order_luc = 0
+
+        if self.is_current_pos_flat():
+            if action == 0:
+                order_action = ORDER_ACTION_SELL_SHORT
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_bid()
+                order_qty = qty
+                order_ts = self.current_time_step
+                order_luc = 0
+            elif action == 1:
+                order_action = ORDER_ACTION_BUY
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_ask()
+                order_qty = qty
+                order_ts = self.current_time_step
+                order_luc = 0
+        elif self.is_current_pos_long():
+            if action == 0:
+                order_action = ORDER_ACTION_SELL
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_bid()
+                order_qty = qty
+                order_ts = self.current_time_step
+                order_luc = 0
+            elif action == 1:
+                order_action = ORDER_ACTION_BUY
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_ask()
+                order_qty = qty
+                order_ts = self.current_time_step
+                order_luc = 0
+            if action == 2:
+                order_action = ORDER_ACTION_SELL
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_bid()
+                order_qty = self.get_current_pos_qty()
+                order_ts = self.current_time_step
+                order_luc = 0
+        elif self.is_current_pos_short():
+            if action == 0:
+                order_action = ORDER_ACTION_SELL_SHORT
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_bid()
+                order_qty = qty
+                order_ts = self.current_time_step
+                order_luc = 0
+            elif action == 1:
+                order_action = ORDER_ACTION_BUY_TO_COVER
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_ask()
+                order_qty = qty
+                order_ts = self.current_time_step
+                order_luc = 0
+            if action == 2:
+                order_action = ORDER_ACTION_BUY_TO_COVER
+                order_type = ORDER_TYPE_MARKET
+                order_price = self.get_current_ask()
+                order_qty = self.get_current_pos_qty()
+                order_ts = self.current_time_step
+                order_luc = 0
+
+        order = np.array([order_action, order_type, order_price, order_qty, order_ts, order_luc])
+        self.order_queue = np.vstack([self.order_queue, order])
+
+    def process_order_queue(self):
+        # run through each orders.
+        # If it is eligible for execution add an execution
+
+        for i in range(self.order_queue.shape[0]):
+            order_action = self.order_queue[i, 0]
+            order_type = self.order_queue[i, 1]
+            order_price = self.order_queue[i, 2]
+            order_qty = self.order_queue[i, 3]
+            order_ts = self.order_queue[i, 4]
+            order_luc = self.order_queue[i, 5]
+            if order_type == ORDER_TYPE_MARKET:
+                # ADD THE EXECUTION
+                self.add_execution(self.current_time_step, order_action, order_qty, order_price)
+
+                # REMOVE ORDER FROM QUEUE
+                self.order_queue = np.delete(self.order_queue, i, 0)
+
+    def get_step_reward(self):
+        return self.reward_steps[-1, 0] - self.reward_steps[-2, 0] + self.reward_steps[-1, 1] - self.reward_steps[-2, 1]
+
+    def get_realized_balance(self):
+        return self.balance
+
+    def get_exit_unrlz_value(self, time_step=-1):
+        if time_step == -1:
+            time_step = self.current_time_step
+        if self.get_current_pos_type() == POSTYPE_LONG:
+            exit_unrlz_value = (self.get_current_bid(time_step) - self.get_current_pos_price()) \
+                               * self.get_current_pos_qty() * self.point_value - self.commission_per_order * self.get_current_pos_qty()
+        elif self.get_current_pos_type() == POSTYPE_SHORT:
+            exit_unrlz_value = (self.get_current_pos_price() - self.get_current_ask(time_step)) \
+                               * self.get_current_pos_qty() * self.point_value - self.commission_per_order * self.get_current_pos_qty()
         else:
-            if tot_pnl < self.max_accum_reward_low_point:
-                self.max_accum_reward_low_point = tot_pnl
+            exit_unrlz_value = 0
 
-        self.tmp_transaction = np.array(
-            [post_type, in_time_step, last_price, in_price, out_time_step, last_price, out_price, num_time_steps,
-             pnl, net_pnl, ticks, commission, drawdown])
-        self.transactions = np.vstack([self.transactions, self.tmp_transaction])
+        return exit_unrlz_value
 
-        self.tmp_transaction = np.empty(shape=(0, self.transaction_dim))
+    def get_gross_unrealized_value(self, time_step=-1):
+        if time_step == -1:
+            time_step = self.current_time_step
+        if self.get_current_pos_type() == POSTYPE_LONG:
+            unrlz_value = (self.get_current_bid(
+                time_step) - self.get_current_pos_price()) * self.get_current_pos_qty() * self.point_value
+        elif self.get_current_pos_type() == POSTYPE_SHORT:
+            unrlz_value = (self.get_current_pos_price() - self.get_current_ask(
+                time_step)) * self.get_current_pos_qty() * self.point_value
+        else:
+            unrlz_value = 0
 
-    def print_transactions(self):
-        for i in range(self.transactions.shape[0]):
-            t = self.transactions[i]
-            pos = ''
-            if t[0] == PosType.Short:
-                pos = 'S'
-            elif t[0] == PosType.Long:
-                pos = 'L'
-            print("Pos:{}, In_tt:{}, In_Last:{:.2f}, In_Price:{:.2f}, "
-                  "Out_tt:{}, Out_Last:{:.2f}, Out_Price:{:.2f}, TT:{}, Pnl:{:.2f}, Net_Pnl:{:.2f}, Ticks:{:.2f}, Comm:{:.2f}".
-                  format(pos, t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11]))
+        return unrlz_value
 
-    def get_extra_tick(self):
-        return 0
+    def get_exit_ticks_away(self, time_step=-1):
+        if time_step == -1:
+            time_step = self.current_time_step
+        if self.get_current_pos_type() == POSTYPE_LONG:
+            ticks_away = (self.get_current_bid(time_step) - self.get_current_pos_price()) / self.tick_size
+        elif self.get_current_pos_type() == POSTYPE_SHORT:
+            ticks_away = (self.get_current_pos_price() - self.get_current_ask(time_step)) / self.tick_size
+        else:
+            ticks_away = 0
 
-    def add_execution(self, time_step, action, qty, fill_price):
+        return ticks_away
+
+    def exit_pos(self):
+        self.submit_order(action=2, qty=1)
+        self.process_order_queue()
+
+    def add_execution(self, order_time_step, order_action, order_qty, order_price):
         # EnterLong() generates OrderAction.Buy
         # ExitLong() generates OrderAction.Sell
         # EnterShort() generates OrderAction.SellShort
@@ -477,236 +897,252 @@ class TradingEnv(gym.Env):
         # - Position Qty
         # - Position Avg Price
 
-        pos_type = action
-        pos_qty = qty
-        pos_avg_price = fill_price
+        order_action_type = -1
+        if order_action == ORDER_ACTION_BUY_TO_COVER or order_action == ORDER_ACTION_BUY:
+            order_action_type = POSTYPE_LONG
+        elif order_action == ORDER_ACTION_SELL or order_action == ORDER_ACTION_SELL_SHORT:
+            order_action_type = POSTYPE_SHORT
+        else:
+            AssertionError()
+
+        pos_ts = order_time_step
+        pos_qty = order_qty
+        pos_avg_price = order_price
+        pos_type = order_action_type
+
+        # ADJUST ORDER COMMISSIONS TO BALANCE
+        self.balance -= order_qty * self.commission_per_order
+
         if self.executions.shape[0] > 0:
             # Get Last Position info
-            last_time_step = self.executions[-1,0]
-            last_pos = self.executions[-1, 4]
-            last_pos_qty = self.executions[-1, 5]
-            last_pos_avg_price = self.executions[-1, 6]
+            last_pos_time_step = self.get_current_pos_ts()
+            last_pos = self.get_current_pos_type()
+            last_pos_qty = self.get_current_pos_qty()
+            last_pos_avg_price = self.get_current_pos_price()
 
-            if (action == PosType.Long and last_pos == PosType.Long) or \
-                    (action == PosType.Short and last_pos == PosType.Short):
-                pos_type = PosType.Long
-                pos_qty = last_pos_qty + qty
-                pos_avg_price = (qty*fill_price + last_pos_qty*last_pos_avg_price) / (qty+last_pos_qty)
-            elif action == PosType.Long and last_pos == PosType.Short:
-                if qty>last_pos_qty:
-                    pos_type = PosType.Long
-                    pos_qty = qty - last_pos_qty
-                    pos_avg_price = fill_price
-                elif qty<last_pos_qty:
-                    pos_type = PosType.Short
-                    pos_qty = last_pos_qty - qty
+            pos_ts = last_pos_time_step
+
+            if last_pos == POSTYPE_FLAT:
+                pos_type = order_action_type
+                pos_qty = order_qty
+                pos_avg_price = order_price
+                pos_ts = order_time_step
+            elif order_action_type == POSTYPE_LONG and last_pos == POSTYPE_LONG:
+                pos_type = POSTYPE_LONG
+                pos_qty = last_pos_qty + order_qty
+                pos_avg_price = ((last_pos_avg_price * last_pos_qty) + (order_price * order_qty)) / (
+                        last_pos_qty + order_qty)
+            elif order_action_type == POSTYPE_SHORT and last_pos == POSTYPE_SHORT:
+                pos_type = POSTYPE_SHORT
+                pos_qty = last_pos_qty + order_qty
+                pos_avg_price = ((last_pos_avg_price * last_pos_qty) + (order_price * order_qty)) / (
+                        last_pos_qty + order_qty)
+            elif order_action_type == POSTYPE_SHORT and last_pos == POSTYPE_LONG:
+                if last_pos_qty > order_qty:
+                    # DEFINE REMAINING POSITION
+                    pos_type = POSTYPE_LONG
+                    pos_qty = last_pos_qty - order_qty
                     pos_avg_price = last_pos_avg_price
-                else: # qty==last_pos_qty:
-                    pos_type = PosType.Flat
+
+                    # ADD A TRANSACTION FOR MATCHING QTY
+                    self.add_transaction(POSTYPE_LONG, order_qty, last_pos_time_step, last_pos_avg_price,
+                                         order_time_step, order_price)
+
+                    # ADJUST BALANCE
+                    self.balance += (order_price - last_pos_avg_price) * order_qty * self.point_value
+                elif last_pos_qty < order_qty:
+                    # DEFINE REMAINING POSITION
+                    pos_type = POSTYPE_SHORT
+                    pos_qty = order_qty - last_pos_qty
+                    pos_avg_price = order_price
+
+                    # ADD A TRANSACTION FOR MATCHING QTY
+                    self.add_transaction(POSTYPE_LONG, last_pos_qty, last_pos_time_step, last_pos_avg_price,
+                                         order_time_step, order_price)
+
+                    # ADJUST BALANCE
+                    self.balance += (order_price - last_pos_avg_price) * last_pos_qty * self.point_value
+                else:
+                    # DEFINE REMAINING POSITION
+                    pos_type = POSTYPE_FLAT
                     pos_qty = 0
-                    pos_avg_price = 0
-            elif action == PosType.Short and last_pos == PosType.Long:
-                if qty>last_pos_qty:
-                    pos_type = PosType.Short
-                    pos_qty = qty - last_pos_qty
-                    pos_avg_price = fill_price
-                elif qty<last_pos_qty:
-                    pos_type = PosType.Long
-                    pos_qty = last_pos_qty - qty
+                    pos_avg_price = None
+
+                    # ADD A TRANSACTION FOR MATCHING QTY
+                    self.add_transaction(POSTYPE_LONG, order_qty, last_pos_time_step, last_pos_avg_price,
+                                         order_time_step, order_price, True)
+
+                    # ADJUST BALANCE
+                    self.balance += (order_price - last_pos_avg_price) * order_qty * self.point_value
+
+                    # RESET POSITION_TIME_STEP AND INACTIVE TIME_STEP
+                    self.inactive_time_step = 0
+                    self.position_time_step = 0
+            elif order_action_type == POSTYPE_LONG and last_pos == POSTYPE_SHORT:
+                if last_pos_qty > order_qty:
+                    # DEFINE REMAINING POSITION
+                    pos_type = POSTYPE_SHORT
+                    pos_qty = last_pos_qty - order_qty
                     pos_avg_price = last_pos_avg_price
-                else: # qty==last_pos_qty:
-                    pos_type = PosType.Flat
+
+                    # ADD A TRANSACTION FOR MATCHING QTY
+                    self.add_transaction(POSTYPE_SHORT, order_qty, last_pos_time_step, last_pos_avg_price,
+                                         order_time_step, order_price)
+
+                    # ADJUST BALANCE
+                    self.balance += (last_pos_avg_price - order_price) * order_qty * self.point_value
+                elif last_pos_qty < order_qty:
+                    # DEFINE REMAINING POSITION
+                    pos_type = POSTYPE_LONG
+                    pos_qty = order_qty - last_pos_qty
+                    pos_avg_price = order_price
+
+                    # ADD A TRANSACTION FOR MATCHING QTY
+                    self.add_transaction(POSTYPE_SHORT, last_pos_qty, last_pos_time_step, last_pos_avg_price,
+                                         order_time_step, order_price)
+                    # ADJUST BALANCE
+                    self.balance += (last_pos_avg_price - order_price) * last_pos_qty * self.point_value
+                else:
+                    # DEFINE REMAINING POSITION
+                    pos_type = POSTYPE_FLAT
                     pos_qty = 0
-                    pos_avg_price = 0
+                    pos_avg_price = None
 
-        # Let's make sure we don't have any overlapping positions.
-        assert pos_qty == 1 or pos_qty == 0
+                    # ADD A TRANSACTION FOR MATCHING QTY
+                    self.add_transaction(POSTYPE_SHORT, order_qty, last_pos_time_step, last_pos_avg_price,
+                                         order_time_step, order_price, True)
+                    # ADJUST BALANCE
+                    self.balance += (last_pos_avg_price - order_price) * order_qty * self.point_value
 
-        execution = np.array([time_step, action, qty, fill_price, pos_type, pos_qty, pos_avg_price])
+                    # RESET POSITION_TIME_STEP AND INACTIVE TIME_STEP
+                    self.inactive_time_step = 0
+                    self.position_time_step = 0
+
+        execution = np.array(
+            [pos_ts, order_action_type, order_qty, order_price, pos_type, pos_qty, pos_avg_price])
         self.executions = np.vstack([self.executions, execution])
 
-    def get_execution_unrlz_step_value(self):
-        is_last = False
-        i_last = -1
-        if self.executions[i_last, 4] == PosType.Flat and self.executions.shape[0] > 1 and self.executions[i_last, 0] == self.current_time_step:
-            i_last = -2
-            is_last = True
-        last_time_step = self.executions[i_last, 0]
-        last_pos = self.executions[i_last, 4]
-        last_pos_qty = self.executions[i_last, 5]
-        last_pos_avg_price = self.executions[i_last, 6]
+    def add_transaction(self, pos_type, pos_qty, in_time_step, in_price, out_time_step, out_price, is_flat=False):
+        # TRANSACTIONS:
+        # 0 - pos_type
+        # 1 - in_time_step
+        # 2 - pos_qty
+        # 3 - in_price
+        # 4 - out_time_step
+        # 5 - last_price - --> NOT USED
+        # 6 - out_price
+        # 7 - num_time_steps
+        # 8 - pnl - --> NOT USED
+        # 9 - net_pnl
+        # 10 - ticks
+        # 11 - commissions
+        # 12 - drawdown
+        commissions = 2 * pos_qty * self.commission_per_order
+        num_time_steps = out_time_step - in_time_step
+        net_pnl = 0
+        if pos_type == POSTYPE_LONG:
+            net_pnl = (out_price - in_price) * pos_qty * self.point_value - commissions
+        elif pos_type == POSTYPE_SHORT:
+            net_pnl = (in_price - out_price) * pos_qty * self.point_value - commissions
+        else:
+            AssertionError()
+        ticks = (out_price - in_price) / self.tick_size
+        drawdown = self.max_drawdown
 
-        unrlzd_step_value = 0
-        if last_pos is not PosType.Flat:
-            if last_time_step < self.current_time_step:
-                if last_pos == PosType.Long:
-                    unrlzd_step_value += (self.get_current_bid()-self.get_current_bid(time_step=self.current_time_step-1))*last_pos_qty*self.tick_value/self.tick_size
-                elif last_pos == PosType.Short:
-                    unrlzd_step_value += (self.get_current_ask(time_step=self.current_time_step-1)-self.get_current_ask())*last_pos_qty*self.tick_value/self.tick_size
-            else:
-                # charge the commission at the begining of the order
-                unrlzd_step_value += - self.commission_per_order * 2
-                if last_pos == PosType.Long:
-                    unrlzd_step_value += (self.get_current_bid()-last_pos_avg_price)*last_pos_qty*self.tick_value/self.tick_size
-                elif last_pos == PosType.Short:
-                    unrlzd_step_value += (last_pos_avg_price - self.get_current_ask())*last_pos_qty*self.tick_value/self.tick_size
+        # Calculate max accumulated reward
+        tot_pnl = self.get_tot_tran_pnl()
+        if tot_pnl > self.max_accum_reward:
+            self.max_accum_reward = tot_pnl
+            self.max_accum_reward_low_point = tot_pnl
+            self.max_accum_reward_start = in_time_step
+            self.max_accum_reward_low_point_end = in_time_step
+            max_acc = np.array([tot_pnl, in_time_step, tot_pnl, in_time_step])
+            self.max_accum_losses = np.vstack([self.max_accum_losses, max_acc])
+        else:
+            if tot_pnl < self.max_accum_reward_low_point:
+                self.max_accum_reward_low_point = tot_pnl
+                self.max_accum_reward_low_point_end = out_time_step
+                self.max_accum_losses[-1, 2] = tot_pnl
+                self.max_accum_losses[-1, 3] = out_time_step
 
-        self.execution_order_reward += unrlzd_step_value
+        tmp_transaction = np.array(
+            [pos_type, in_time_step, pos_qty, in_price, out_time_step, 0, out_price, num_time_steps,
+             0, net_pnl, ticks, commissions, drawdown])
+        self.transactions = np.vstack([self.transactions, tmp_transaction])
 
-        if is_last:
-            # str1 = "{:.2f}".format(self.execution_order_reward)
-            # str2 = "{:.2f}".format(np.sum(self.transactions[-1:, 9]))
-            # if str1 != str2:
-            #     print("Error detected on step rewards")
-            # print("TimeStep {}, Step Reward: {:.2f}, Pnl Rewards {:.2f}".format(self.current_time_step,
-            #                                                                     self.execution_order_reward,
-            #                                                                     np.sum(self.transactions[-1:, 9])))
-            self.execution_order_reward = 0
+        self.transaction_added = True
 
-        return unrlzd_step_value
-
-    def exit_long(self):
-        # Update the realized value for 1 share
-        new_qty = self.get_book_qty() - 1
-        new_price_val = self.get_current_bid()  # - self.get_extra_tick()
-        new_unr_val = self.get_book_unrealized_value(new_price_val)
-        new_realized_val = self.get_book_realized_value() + new_unr_val - self.commission_per_order
-        new_pos = PosType.Flat
-        self.position_time_step = 0
-        self.inactive_time_step = -1
-        self.update_book(new_pos, new_price_val, new_qty, new_realized_val)
-
-        # Close temp transaction and add to transaction history
-        self.tmp_trans_close(self.current_time_step, self.get_current_price(), self.get_current_bid(),
-                             new_unr_val)
-
-        # Add execution transactions.
-        self.add_execution(self.current_time_step, PosType.Short, 1, self.get_current_bid())
-
-    def enter_short(self):
-        # Update the realized value for 1 share
-        new_qty = self.get_book_qty() + 1
-        new_price_val = self.get_current_bid()  # - self.get_extra_tick()
-        new_realized_val = self.get_book_realized_value() - self.commission_per_order
-        new_pos = PosType.Short
-        self.update_book(new_pos, new_price_val, new_qty, new_realized_val)
-
-        # start a transaction
-        self.tmp_trans_start(PosType.Short, self.current_time_step, self.get_current_price(), new_price_val)
-
-        # Starting new position
-        self.position_time_step = 0
-        self.inactive_time_step = 0
-
-        # set drawdown to 0 when entering transaction
-        self.max_drawdown = 0
-
-        # Add execution transactions.
-        self.add_execution(self.current_time_step, PosType.Short, 1, self.get_current_bid())
-
-    def exit_short(self):
-        # Update the realized value for 1 share
-        new_qty = self.get_book_qty() - 1
-        new_price_val = self.get_current_ask()  # + self.get_extra_tick()
-        new_unr_val = self.get_book_unrealized_value(new_price_val)
-        new_realized_val = self.get_book_realized_value() + new_unr_val - self.commission_per_order
-        new_pos = PosType.Flat
-        self.position_time_step = 0
-        self.inactive_time_step = -1
-        self.update_book(new_pos, new_price_val, new_qty, new_realized_val)
-        transaction_closed = True
-
-        # Close temp transaction and add to transaction history
-        self.tmp_trans_close(self.current_time_step, self.get_current_price(), self.get_current_ask(),
-                             new_unr_val)
-
-        # Add execution transactions.
-        self.add_execution(self.current_time_step, PosType.Long, 1, self.get_current_ask())
-
-    def enter_long(self):
-        # Update the realized value for 1 share
-        new_qty = self.get_book_qty() + 1
-        new_price_val = self.get_current_ask()  # + self.get_extra_tick()
-        new_realized_val = self.get_book_realized_value() - self.commission_per_order
-        new_pos = PosType.Long
-        self.update_book(new_pos, new_price_val, new_qty, new_realized_val)
-
-        # start a transaction
-        self.tmp_trans_start(PosType.Long, self.current_time_step, self.get_current_price(), new_price_val)
-
-        # Starting new position
-        self.position_time_step = 0
-        self.inactive_time_step = 0
-
-        # set drawdown to 0 when entering transaction
-        self.max_drawdown = 0
-
-        # Add execution transactions.
-        self.add_execution(self.current_time_step, PosType.Long, 1, self.get_current_ask())
-
-    def print_transaction_summary(self, session_expired):
-        try:
-            if session_expired:
-                self.session_count += 1
-                self.last_session_printed = True
-            # avg_num_tt = np.mean(self.transactions[:, 7])
-            max_num_tt = np.max(self.transactions[:, 7])
-            # avg_pnl = np.mean(self.transactions[:, 9])
-            tot_pnl = np.sum(self.transactions[:, 9])
-            avg_win = np.mean(self.transactions[:, 9][np.where(self.transactions[:, 9] >= 0)])
-            avg_win_tt = np.mean(self.transactions[:, 7][np.where(self.transactions[:, 9] >= 0)])
-            avg_loss = np.mean(self.transactions[:, 9][np.where(self.transactions[:, 9] < 0)])
-            avg_loss_tt = np.mean(self.transactions[:, 7][np.where(self.transactions[:, 9] < 0)])
-            time_step = self.transactions[-1][4]
-            tot_trans = self.transactions.shape[0]
-            num_wins = np.array(np.where(self.transactions[:, 9] > 0)).shape[1]
-            num_losses = np.asarray(np.where(self.transactions[:, 9] < 0)).shape[1]
-            num_wins_long = \
-                np.array(np.where((self.transactions[:, 9] > 0) & (self.transactions[:, 0] == PosType.Long))).shape[
-                    1]
-            num_losses_long = \
-                np.array(np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Long))).shape[
-                    1]
-            num_wins_short = \
-                np.array(
-                    np.where((self.transactions[:, 9] > 0) & (self.transactions[:, 0] == PosType.Short))).shape[1]
-            num_losses_short = \
-                np.array(
-                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Short))).shape[1]
-            num_long = self.transactions[np.where(self.transactions[:, 0] == PosType.Long)].shape[0]
-            num_short = self.transactions[np.where(self.transactions[:, 0] == PosType.Short)].shape[0]
-            # avg_drawdown = np.mean(self.transactions[:, 12])
-            # max_drawdown = np.min(self.transactions[:, 12])
-            unr_val = 0
-            if not self.is_current_pos_flat():
-                unr_val = self.get_book_unrealized_value(self.get_current_price())
-
-            print("TimeStep: {}, TotTrans: {}, TotPnl: {:.2f}, Unrlzd:{:.2f}, MaxTS: {}, "
-                  "WinTS: {:.2f}, LossTS: {:.2f}, AvgWin: {:.2f}, AvgLoss: {:.2f}, W/L: {}/{}, L/S: {}/{}, "
-                  "W/L Long: {}/{}, W/L Short: {}/{}".
-                  format(time_step, tot_trans, tot_pnl, unr_val, max_num_tt,
-                         avg_win_tt, avg_loss_tt, avg_win, avg_loss, num_wins, num_losses, num_long, num_short,
-                         num_wins_long, num_losses_long, num_wins_short, num_losses_short))
-
-            if session_expired:
-                print('session {}, final time step {}...'.format(self.session_count, self.current_time_step))
-
-            if self.max_time_steps - self.current_time_step <= 1:
-                print('Last step...{}/{}'.format(self.max_time_steps, self.current_time_step))
-        except:
-            error = True
+        # if shuffling per transaction we must trigger the reset of starting step.
+        if self.shuffle_per_tran and is_flat:
+            # eliminate this entry point from our list if it had a postive return
+            # if net_pnl >= 0:
+            self.shuffle_per_tran_step_list = list(set(self.shuffle_per_tran_step_list) - {int(in_time_step)})
+            self.shuffle_per_tran_trigger = True
+            if len(self.shuffle_per_tran_step_list) % 1000 == 0:
+                print("{} entry points left.".format(len(self.shuffle_per_tran_step_list)))
+                logging.debug("{} entry points left.".format(len(self.shuffle_per_tran_step_list)))
 
     def get_tot_tran_pnl(self):
         tot_pnl = 0
         if self.transactions.shape[0] > 0:
             tot_pnl = np.sum(self.transactions[:, 9])
-        return tot_pnl
+        return float(tot_pnl)
+
+    def get_shuffle_per_tran_current_time_step(self):
+        if len(self.shuffle_per_tran_step_list) == 0:
+            if self.end_time_step is not None:
+                i_range = int(self.end_time_step * .96)
+            else:
+                i_range = int(self.featureList.shape[0] * .96)
+            self.shuffle_per_tran_step_list = list(range(self.start_time_step, i_range))
+            print("Generating new shuffle list")
+            logging.debug("Generating new shuffle list")
+
+        return choice(self.shuffle_per_tran_step_list)
+
+    # def set_table_col_names(self):
+    #     self.table.set_column_header("ts", col=0)
+    #     self.table.set_column_header("current_ts", col=1)
+    #     self.table.set_column_header("tot_trans", col=2)
+    #     self.table.set_column_header("tot_pnl", col=3)
+    #     self.table.set_column_header("pos", col=4)
+    #     self.table.set_column_header("unr_val", col=5)
+    #     self.table.set_column_header("pos_qty", col=6)
+    #     self.table.set_column_header("max_num_tt", col=7)
+    #     self.table.set_column_header("avg_long_win", col=8)
+    #     self.table.set_column_header("avg_long_loss", col=9)
+    #     self.table.set_column_header("avg_long_win_ts", col=10)
+    #     self.table.set_column_header("avg_long_loss_ts", col=11)
+    #     self.table.set_column_header("avg_short_win", col=12)
+    #     self.table.set_column_header("avg_short_loss", col=13)
+    #     self.table.set_column_header("avg_short_win_ts", col=14)
+    #     self.table.set_column_header("avg_short_loss_ts", col=15)
+    #     self.table.set_column_header("num_long, num_short", col=16)
+    #     self.table.set_column_header("num_wins_long", col=17)
+    #     self.table.set_column_header("num_losses_long", col=18)
+    #     self.table.set_column_header("num_wins_short", col=19)
+    #     self.table.set_column_header("num_losses_short", col=20)
 
     def print_transaction_summary2(self, session_expired):
+        # TRANSACTIONS:
+        # 0 - pos_type
+        # 1 - in_time_step
+        # 2 - pos_qty
+        # 3 - in_price
+        # 4 - out_time_step
+        # 5 - last_price - --> NOT USED
+        # 6 - out_price
+        # 7 - num_time_steps
+        # 8 - pnl - --> NOT USED
+        # 9 - net_pnl
+        # 10 - ticks
+        # 11 - commissions
+        # 12 - drawdown
         try:
             # print a new line when we start printing for the first time.
             if self.num_print_trans == 0:
                 print("\n")
+                logging.debug("\n")
             self.num_print_trans += 1
 
             if session_expired:
@@ -717,8 +1153,8 @@ class TradingEnv(gym.Env):
             # avg_pnl = np.mean(self.transactions[:, 9])
             tot_pnl = np.sum(self.transactions[:, 9])
 
-            num_long = self.transactions[np.where(self.transactions[:, 0] == PosType.Long)].shape[0]
-            num_short = self.transactions[np.where(self.transactions[:, 0] == PosType.Short)].shape[0]
+            num_long = self.transactions[np.where(self.transactions[:, 0] == POSTYPE_LONG)].shape[0]
+            num_short = self.transactions[np.where(self.transactions[:, 0] == POSTYPE_SHORT)].shape[0]
             avg_long_win = 0
             avg_long_win_tt = 0
             avg_long_loss = 0
@@ -727,168 +1163,166 @@ class TradingEnv(gym.Env):
             avg_short_win_tt = 0
             avg_short_loss = 0
             avg_short_loss_tt = 0
+            avg_qty_long = 0
+            avg_qty_short = 0
+            max_qty_long = 0
+            max_qty_short = 0
             if num_long > 0:
                 trans = self.transactions[:, 9][
-                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == PosType.Long))]
+                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == POSTYPE_LONG))]
                 if len(trans) > 0: avg_long_win = np.mean(trans)
 
                 trans = self.transactions[:, 7][
-                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == PosType.Long))]
+                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == POSTYPE_LONG))]
                 if len(trans) > 0: avg_long_win_tt = np.mean(trans)
 
                 trans = self.transactions[:, 9][
-                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Long))]
+                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == POSTYPE_LONG))]
                 if len(trans) > 0: avg_long_loss = np.mean(trans)
 
                 trans = self.transactions[:, 7][
-                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Long))]
+                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == POSTYPE_LONG))]
                 if len(trans) > 0: avg_long_loss_tt = np.mean(trans)
+
+                trans = self.transactions[:, 2][
+                    np.where((self.transactions[:, 0] == POSTYPE_LONG))]
+                if len(trans) > 0:
+                    avg_qty_long = np.mean(trans)
+                    max_qty_long = np.max(trans)
+
             if num_short > 0:
                 trans = self.transactions[:, 9][
-                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == PosType.Short))]
+                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == POSTYPE_SHORT))]
                 if len(trans) > 0: avg_short_win = np.mean(trans)
 
                 trans = self.transactions[:, 7][
-                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == PosType.Short))]
+                    np.where((self.transactions[:, 9] >= 0) & (self.transactions[:, 0] == POSTYPE_SHORT))]
                 if len(trans) > 0: avg_short_win_tt = np.mean(trans)
 
                 trans = self.transactions[:, 9][
-                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Short))]
+                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == POSTYPE_SHORT))]
                 if len(trans) > 0: avg_short_loss = np.mean(trans)
 
                 trans = self.transactions[:, 7][
-                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Short))]
+                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == POSTYPE_SHORT))]
                 if len(trans) > 0: avg_short_loss_tt = np.mean(trans)
+
+                trans = self.transactions[:, 2][
+                    np.where((self.transactions[:, 0] == POSTYPE_SHORT))]
+                if len(trans) > 0:
+                    avg_qty_short = np.mean(trans)
+                    max_qty_short = np.max(trans)
 
             time_step = self.transactions[-1][4]
             tot_trans = self.transactions.shape[0]
             num_wins_long = \
-                np.array(np.where((self.transactions[:, 9] > 0) & (self.transactions[:, 0] == PosType.Long))).shape[
+                np.array(np.where((self.transactions[:, 9] > 0) & (self.transactions[:, 0] == POSTYPE_LONG))).shape[
                     1]
             num_losses_long = \
-                np.array(np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Long))).shape[
+                np.array(np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == POSTYPE_LONG))).shape[
                     1]
             num_wins_short = \
                 np.array(
-                    np.where((self.transactions[:, 9] > 0) & (self.transactions[:, 0] == PosType.Short))).shape[1]
+                    np.where((self.transactions[:, 9] > 0) & (self.transactions[:, 0] == POSTYPE_SHORT))).shape[1]
             num_losses_short = \
                 np.array(
-                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == PosType.Short))).shape[1]
+                    np.where((self.transactions[:, 9] < 0) & (self.transactions[:, 0] == POSTYPE_SHORT))).shape[1]
             # avg_drawdown = np.mean(self.transactions[:, 12])
             # max_drawdown = np.min(self.transactions[:, 12])
             unr_val = 0
             if not self.is_current_pos_flat():
-                unr_val = self.get_book_unrealized_value(self.get_current_price())
+                unr_val = self.get_gross_unrealized_value()
 
             pos = ""
             if self.is_current_pos_long(): pos = "L"
             if self.is_current_pos_short(): pos = "S"
 
-            print("TimeStep:{:>7}, TotTrans:{:>4}, TotPnl:{:6.2f}, Unrlzd:{}{:5.2f}, MaxTS:{:>5}, "
-                  "L-Win/Loss:{:5.2f}/{:5.2f}, L-TS-W/L:{:5.2f}/{:5.2f}, "
-                  "S-Win/Loss:{:5.2f}/{:5.2f}, S-TS-W/L:{:5.2f}/{:5.2f}, "
-                  "L/S:{:>5}/{:>5}, "
-                  "W/L Long:{:>5}/{:>5}, W/L Short:{:>5}/{:>5}".
-                  format(time_step, tot_trans, tot_pnl, pos, unr_val, max_num_tt,
-                         avg_long_win, avg_long_loss, avg_long_win_tt, avg_long_loss_tt,
-                         avg_short_win, avg_short_loss, avg_short_win_tt, avg_short_loss_tt,
-                         num_long, num_short,
-                         num_wins_long, num_losses_long, num_wins_short, num_losses_short))
+            if self.shuffle_per_tran:
+                txt = "TimeStep:{}/{}, TotTrans:{:>4}, TotPnl:{:6.2f}, Unrlzd:{}{:5.2f}, Qty:{}, Avg Qty L/S:{:4.0f}/{:4.0f}, MaxTS:{:>5}, " \
+                      "L-Win/Loss:{:5.2f}/{:5.2f}, L-TS-W/L:{:5.2f}/{:5.2f}, "\
+                      "S-Win/Loss:{:5.2f}/{:5.2f}, S-TS-W/L:{:5.2f}/{:5.2f}, "\
+                      "L/S:{:>5}/{:>5}, "\
+                      "W/L Long:{:>5}/{:>5}, W/L Short:{:>5}/{:>5}".format(time_step, self.shuffle_per_tran_tt_counter, tot_trans, tot_pnl, pos, unr_val,
+                           self.get_current_pos_qty(),
+                           avg_qty_long, avg_qty_short,
+                           max_num_tt, avg_long_win, avg_long_loss, avg_long_win_tt, avg_long_loss_tt,
+                           avg_short_win, avg_short_loss, avg_short_win_tt, avg_short_loss_tt,
+                           num_long, num_short,
+                           num_wins_long, num_losses_long, num_wins_short, num_losses_short)
+                print(txt)
+                logging.debug(txt)
+            else:
+                txt = "TimeStep:{:>7}/{}, TotTrans:{:>4}, TotPnl:{:6.2f}, Unrlzd:{}{:5.2f}, Qty:{}, Avg Qty L/S:{:4.0f}/{:4.0f}, MaxTS:{:>5}, "\
+                    "L-Win/Loss:{:5.2f}/{:5.2f}, L-TS-W/L:{:5.2f}/{:5.2f}, "\
+                    "S-Win/Loss:{:5.2f}/{:5.2f}, S-TS-W/L:{:5.2f}/{:5.2f}, "\
+                    "L/S:{:>5}/{:>5}, "\
+                    "W/L Long:{:>5}/{:>5}, W/L Short:{:>5}/{:>5}".format(time_step, self.current_time_step, tot_trans, tot_pnl, pos, unr_val,
+                           self.get_current_pos_qty(),
+                           avg_qty_long, avg_qty_short, max_num_tt,
+                           avg_long_win, avg_long_loss, avg_long_win_tt, avg_long_loss_tt,
+                           avg_short_win, avg_short_loss, avg_short_win_tt, avg_short_loss_tt,
+                           num_long, num_short,
+                           num_wins_long, num_losses_long, num_wins_short, num_losses_short)
+                print(txt)
+                logging.debug(txt)
 
             if session_expired:
                 print('session {}, final time step {}...'.format(self.session_count, self.current_time_step))
+                logging.debug('session {}, final time step {}...'.format(self.session_count, self.current_time_step))
 
             if self.max_time_steps - self.current_time_step <= 1:
                 print('Last step...{}/{}'.format(self.max_time_steps, self.current_time_step))
+                logging.debug('Last step...{}/{}'.format(self.max_time_steps, self.current_time_step))
         except:
             error = True
 
-    def get_last_transaction(self):
-        last_pos = 0
-        last_return = 0
-        if self.transactions.shape[0] > 0:
-            pos = self.transactions[-1, 0]
-            if pos == PosType.Long: last_pos = 1
-            last_return = self.transactions[-1, 9] / self.max_return_norm
-
-        return last_pos, last_return
-
-    def is_same_entry_as_previous(self, pos):
-        pos_val = 0
-        if pos == PosType.Long:
-            pos_val = 1
-
-        last_pos, last_return = self.get_last_transaction()
-        ret = False
-        if pos_val == last_pos and last_return < 0:
-            ret = True
-        return ret
-
-    def get_discounted_unrlzd_value(self):
-        fv = 0
-        r = 0.03
-        i_tran = len(self.tran_unrlz_value)
-        if i_tran == 1:
-            fv = self.tran_unrlz_value[i_tran - 1]
-        elif i_tran > 1:
-            fv = self.tran_unrlz_value[i_tran - 1] - self.tran_unrlz_value[i_tran - 2]
-
-        pv = fv / (1 + r) ** i_tran
-
-        return pv
-
-    def get_exit_unrlz_value(self, time_step=-1):
-        if time_step == -1:
-            time_step = self.current_time_step
-        exit_unrlz = 0
-        commission = self.commission_per_order
-        if self.is_current_pos_long():
-            exit_unrlz = self.get_book_unrealized_value(self.get_current_bid(time_step=time_step))
-        elif self.is_current_pos_short():
-            exit_unrlz = self.get_book_unrealized_value(self.get_current_ask(time_step=time_step))
-        else:
-            commission = 0
-        net_unrlz = exit_unrlz - commission  # Just the exit commission.
-        return net_unrlz
-
-    def step_flat(self):
-        if self.is_current_pos_flat():
-            self.current_time_step += 1
-
-    @deprecated(version='1.0.0', reason="This funciton was used when FeatureList contained  Elliott single pivots")
-    def enter_action_votes(self, current_time_step=None, n_features=30):
-        if current_time_step is None:
-            current_time_step = self.current_time_step
-        features = self.feature_info[:, 0:n_features]
-        cnt = features.shape[1]
-        sum = (cnt / 2) * (1 + cnt)
-        votes_long = 0
-        votes_short = 0
-        for i in range(cnt):
-            vote = (i + 1) / sum
-            zigzag = features[current_time_step, i]
-            if zigzag >= 0.5:
-                votes_long += vote
-            else:
-                votes_short += vote
-        return votes_long, votes_short
-
-    @deprecated(version='1.0.0', reason="This funciton was used when FeatureList contained  Elliott single pivots")
-    def enter_action(self):
-        votes_long, votes_short = self.enter_action_votes(self.current_time_step)
-        if votes_short <= votes_long:
-            action = 1
-        else:
-            action = 0
-        return action
-
-    def plot_episode_returns(self):
+    def plot_episode_returns(self, show=True):
+        # change if NUMPY
+        # plt.plot(np.asnumpy(self.episode_rewards))
         plt.plot(self.episode_rewards)
+        plt.axhline(y=0, color='silver', linestyle='-')
         plt.xlabel = 'Episode'
         plt.ylabel = 'PnL'
-        plt.show()
+        try:
+            plt.savefig(self.output_path + 'plot_episode_returns.png')
+        except:
+            print("An exception occurred while printing " + 'plot_episode_returns.png')
+            logging.debug("An exception occurred while printing " + 'plot_episode_returns.png')
+        if show: plt.show()
+        plt.clf()
 
-    def plot_price_and_returns(self):
+    def plot_prices(self, show=True):
+        start = self.start_time_step
+        end = self.end_time_step
+        if self.end_time_step == None: end = self.featureList.shape[0]
+        plt.plot(self.featureList[start:end, 0])
+        plt.xlabel = 'Time Steps'
+        plt.ylabel = 'Price'
+        try:
+            plt.savefig(self.output_path + 'plot_prices.png')
+        except:
+            print("An exception occurred while printing " + 'plot_prices.png')
+            logging.debug("An exception occurred while printing " + 'plot_prices.png')
+
+        if show: plt.show()
+        plt.clf()
+
+    def plot_price_and_returns(self, show=True):
+        # TRANSACTIONS:
+        # 0 - pos_type
+        # 1 - in_time_step
+        # 2 - last_price - --> NOT USED
+        # 3 - in_price
+        # 4 - out_time_step
+        # 5 - last_price - --> NOT USED
+        # 6 - out_price
+        # 7 - num_time_steps
+        # 8 - pnl - --> NOT USED
+        # 9 - net_pnl
+        # 10 - ticks
+        # 11 - commissions
+        # 12 - drawdown
+
         # Print Rewards
         # x = self.env.transactions[:, 1]
         y = self.transactions[:, 9].cumsum()
@@ -906,13 +1340,13 @@ class TradingEnv(gym.Env):
             if i > 0:
                 y1 = y[i - 1]
             y2 = y[i]
-            if self.transactions[i][0] == PosType.Long:
+            if self.transactions[i][0] == POSTYPE_LONG:
                 axs[0].plot([x1, x2], [y1, y2], 'g')
             else:
                 axs[0].plot([x1, x2], [y1, y2], 'r')
-
         # ax1.plot(x, y, color=color)
         axs[0].tick_params(axis='y', labelcolor=color)
+        axs[0].axhline(y=0, color='silver', linestyle='-')
 
         # ax1.set_xlabel('Time Step')
         # ax1.xaxis.label.set_color('cyan')
@@ -928,7 +1362,7 @@ class TradingEnv(gym.Env):
                 x_i += 1
         # ax2 = ax1.twinx()
         color = 'tab:blue'
-        axs[1].set_xlabel("Time Step. Episode {}".format(len(self.episode_rewards)))
+        axs[1].set_xlabel("Time Step. Episode {}".format(len(self.episode_rewards)-1))
         axs[1].xaxis.label.set_color('cyan')
         axs[1].tick_params(axis='x', colors='cyan')
         axs[1].set_ylabel('Price', color=color)  # we already handled the x-label with ax1
@@ -938,8 +1372,8 @@ class TradingEnv(gym.Env):
             x1 = self.transactions[i][1]
             x2 = self.transactions[i][4]
             y1 = self.transactions[i][3]
-            y2 = self.transactions[i][5]
-            if self.transactions[i][0] == PosType.Long:
+            y2 = self.transactions[i][6]
+            if self.transactions[i][0] == POSTYPE_LONG:
                 axs[1].plot([x1, x2], [y1, y2], 'g')
             else:
                 axs[1].plot([x1, x2], [y1, y2], 'r')
@@ -948,164 +1382,191 @@ class TradingEnv(gym.Env):
 
         fig.tight_layout()  # otherwise the right y-label is slightly clipped
         fig.set_size_inches(11, 8)
-        plt.show()
+        try:
+            plt.savefig(self.output_path + 'plot_price_and_returns_' + str(len(self.episode_rewards)-1) + '.png')
+        except:
+            print("An exception occurred while printing " + 'plot_price_and_returns_' + str(len(self.episode_rewards)) + '.png')
+            logging.debug("An exception occurred while printing " + 'plot_price_and_returns_' + str(len(self.episode_rewards)) + '.png')
+        if show: plt.show()
+        plt.clf()
 
-    def step_fast_forward(self):
-        # prevent from getting called back while looping.
-        self.ff = True
+    def plot_returns(self, show=True):
+        # TRANSACTIONS:
+        # 0 - pos_type
+        # 1 - in_time_step
+        # 2 - last_price - --> NOT USED
+        # 3 - in_price
+        # 4 - out_time_step
+        # 5 - last_price - --> NOT USED
+        # 6 - out_price
+        # 7 - num_time_steps
+        # 8 - pnl - --> NOT USED
+        # 9 - net_pnl
+        # 10 - ticks
+        # 11 - commissions
+        # 12 - drawdown
 
-        stop_ff = False
-        state, ret_reward, info = None, None, None
-        while not stop_ff:
-            state, ret_reward, self.done, info = self.step(-1)
-            unrlz = self.get_exit_unrlz_value()
-            if self.done or unrlz > 0 or unrlz <= -self.min_ff_loss or self.is_current_pos_flat():
-                stop_ff = True
+        # Print Rewards
+        # x = self.env.transactions[:, 1]
+        y = self.transactions[:, 9].cumsum()
+        # fig, (ax1, ax2) = plt.subplots(2)
+        fig = plt.figure()
+        gs = fig.add_gridspec(ncols=1, nrows=2, hspace=0)
+        axs = gs.subplots(sharex=True, sharey=False)
+        color = 'tab:green'
+        # ax1.set_xlabel('Time Step')
+        axs[0].set_ylabel('Reward', color=color)
+        for i in range(self.transactions.shape[0]):
+            x1 = self.transactions[i][1]
+            x2 = self.transactions[i][4]
+            y1 = 0
+            if i > 0:
+                y1 = y[i - 1]
+            y2 = y[i]
+            if self.transactions[i][0] == POSTYPE_LONG:
+                axs[0].plot([x1, x2], [y1, y2], 'g')
+            else:
+                axs[0].plot([x1, x2], [y1, y2], 'r')
 
-        self.ff = False
-        return state, ret_reward, self.done, info
+        # ax1.plot(x, y, color=color)
+        axs[0].tick_params(axis='y', labelcolor=color)
 
-    def skip(self, no_steps=1000):
-        self.ff = True
+        axs[0].axhline(y=0, color='silver', linestyle='-')
 
-        state, ret_reward, info = None, None, None
-        for i in range(no_steps):
-            state, ret_reward, self.done, info = self.step(-1)
-            if self.done or self.current_time_step == self.feature_info.shape[0] - 1:
-                break
+        fig.tight_layout()  # otherwise the right y-label is slightly clipped
+        fig.set_size_inches(11, 8)
+        try:
+            plt.savefig(self.output_path + 'plot_returns_' + str(len(self.episode_rewards)) + '.png')
+        except:
+            print("An exception occurred while printing " + 'plot_returns_' + str(len(self.episode_rewards)) + '.png')
+            logging.debug("An exception occurred while printing " + 'plot_returns_' + str(len(self.episode_rewards)) + '.png')
 
-        self.ff = False
-        return state, ret_reward, self.done, info
+        if show: plt.show()
+        plt.clf()
 
-    def step(self,
-             action,
-             ):
+    def step(self, action=3):
 
-        self.min_ff_loss = self.min_ff_loss
-        # If we want to train a side, we will just modify the action so that it skips when not going
-        # in one direction
-        if not self.ff and self.train_side is not None and self.is_current_pos_flat():
-            if action != self.train_side and self.skip_steps >= 1:
-                # action = -1
-                state, ret_reward, self.done, info = self.skip(self.skip_steps)
-                if self.normalize_return:
-                    ret_reward = (ret_reward + self.skip_incentive) / self.max_return_norm
-                else:
-                    ret_reward = ret_reward + self.skip_incentive
-                return state, ret_reward, self.done, info
-            elif action != self.train_side and self.skip_steps == 0:
-                action = self.train_side
+        # USE THIS INSTEAD OF ACTION MASKING
+        # 0 -> short
+        # 1 -> long
+        # 2 -> close position
+        # 3 -> do nothing
+        # action = act
+        # if self.is_current_pos_flat() and act >= 2:
+        #     if act == 2:
+        #         action = 0
+        #     else:
+        #         action = 1
+        # elif self.is_current_pos_long() and self.get_current_pos_qty() == self.position_max_qty and act == 1:
+        #     action = 3
+        # elif self.is_current_pos_short() and self.get_current_pos_qty() == self.position_max_qty and act == 0:
+        #     action = 3
 
-        self.incentives = 0
+        # if action == 0:
+        #     a = 0
+        # elif action == 1:
+        #     a = 1
+        # elif action == 2:
+        #     a = 2
+        # elif action == 3:
+        #     a = 3
 
         minutes_left_in_session = self.featureList[self.current_time_step][3]
         session_expired = (minutes_left_in_session <= 1) or (self.max_time_steps - self.current_time_step <= 1)
         if not session_expired:
             self.last_session_printed = False
 
+        # VALIDATE ORDER Validate order_action through order_action masking. Return same state with negative reward
+        # if order_action was at fault.
+        # if not self.is_action_valid(action):
+        #     return self.get_state(wall=1), -self.mask_wall_value, False, 0
+
+        if not session_expired:
+            self.submit_order(action, qty=1)
+            self.process_order_queue()
+
         # CHECK FOR MAX PROFIT OR MAX DRAW DOWN WAS HIT TO EXIT
         exit_target = self.take_profit
         exit_stop = self.take_loss
-        exit_target_flag = (self.get_book_unrealized_value(self.get_current_price()) >= exit_target)
-        exit_stop_flag = (self.get_book_unrealized_value(self.get_current_price()) <= -exit_stop)
-        exit_pos = exit_target_flag or exit_stop_flag
+        exit_target_flag = (self.get_gross_unrealized_value() >= exit_target)
+        exit_stop_flag = (self.get_gross_unrealized_value() <= -exit_stop)
+
+        if self.is_current_pos_flat():
+            self.max_exit_unrlz = 0
+        self.max_exit_unrlz = max(self.max_exit_unrlz, self.get_exit_unrlz_value())
+        exit_max_net_drawdown = (self.exit_net_drawdown is not None and
+                                 (self.get_exit_unrlz_value() - self.max_exit_unrlz <= -self.exit_net_drawdown))
+
+        exit_pos = exit_target_flag or exit_stop_flag or exit_max_net_drawdown
 
         # CHECK FOR END OF TIME STEPS TO EXIT POSITION
         if session_expired and (not self.is_current_pos_flat()):
             exit_pos = True
             print('Exiting none flat position on last time step...{}'.format(self.current_time_step))
-
-        # if (exit_target_flag):
-        #     print("Took Profit...")
-        # if (exit_stop_flag):
-        #     print("Forced Exit Stop Loss...")
-
-        # CHECK FOR MAX PROFIT OR MAX DRAW DOWN WAS HIT TO EXIT
-        # exit_pos = (action == 2 and self.get_book_unrealized_value(self.get_current_price()) >= 200) or \
-        #            (action == 2 and self.get_book_unrealized_value(self.get_current_price()) <= -500)
-        # if exit_pos:
-        #     print("Forced Exit")
-
-        tran_closed = False
-        # net_unrlz = self.get_exit_unrlz_value()
-        tt = self.position_time_step
-        can_exit = True  # net_unrlz > 0 or net_unrlz < -900 # or tt >= 30
-        if action == 1 and self.is_current_pos_flat() and (not session_expired):  # ENTER LONG
-            self.enter_long()
-            self.tran_unrlz_value = []
-            if self.is_same_entry_as_previous(PosType.Long):
-                self.incentives += self.same_entry_penalty
-
-        elif (action == 1 and self.is_current_pos_short() and can_exit) or (self.is_current_pos_short() and exit_pos):  # EXIT SHORT
-            self.exit_short()
-            tran_closed = True
-        elif action == 0 and self.is_current_pos_flat() and (not session_expired):  # ENTER SHORT
-            self.enter_short()
-            self.tran_unrlz_value = []
-            if self.is_same_entry_as_previous(PosType.Short):
-                self.incentives += self.same_entry_penalty
-        elif (action == 0 and self.is_current_pos_long() and can_exit) or (self.is_current_pos_long() and exit_pos):  # EXIT LONG
-            self.exit_long()
-            tran_closed = True
-
-        self.done = self.is_margin_call() or self.get_book_realized_value() <= 0 or \
-                    (self.max_time_steps - self.current_time_step <= 1)
+            logging.debug('Exiting none flat position on last time step...{}'.format(self.current_time_step))
 
         # If transaction is still open and episode is done, we need to close the transaction
-        if self.done and not self.is_current_pos_flat():
-            if self.is_current_pos_long():
-                self.exit_long()
-                tran_closed = True
-            elif self.is_current_pos_short():
-                self.exit_short()
-                tran_closed = True
+        if (self.done and not self.is_current_pos_flat()) or exit_pos:
+            self.exit_pos()
 
-        # REWARD
-        reward = self.get_book_realized_value() - self.book.previous_realized_val
-
-        # Calculate exit reward for each step
-        if self.reward_for_each_step:
-            reward = self.get_execution_unrlz_step_value()
-
-        # INCENTIVES AND PENALTIES (NOT BEING USED)
-        # if self.inactive_time_step > 100:
-        #     self.incentives += 0
-        #
-        # if self.position_time_step > 1000:
-        #     self.incentives += 0  # -25
-        #
-        # if 0 < reward < 70:
-        #     self.incentives += 0  # 100
-        #
-        # if self.get_book_unrealized_value(self.get_current_price()) < 0:
-        #     self.incentives += 0  # -.5
-        # elif self.get_book_unrealized_value(self.get_current_price()) > 0:
-        #     self.incentives += 0  # .5
+        self.done = self.is_margin_call() or (self.max_time_steps - self.current_time_step <= 1) or \
+                    (self.shuffle_per_tran_trigger and self.shuffle_per_tran_tt_done is not None and
+                     self.shuffle_per_tran_tt_counter >= self.shuffle_per_tran_tt_done)
 
         # Adjust MAX Drawdown
         if not self.is_current_pos_flat():
-            self.max_drawdown = min(self.max_drawdown, self.get_book_unrealized_value(self.get_current_price()))
+            self.max_drawdown = min(self.max_drawdown, self.get_gross_unrealized_value())
 
-        state = self.get_state()
+        # Move inactive or position time step
+        if self.is_current_pos_flat():
+            self.inactive_time_step += 1
+            self.position_time_step = 0
+        else:
+            self.inactive_time_step = 0
+            self.position_time_step += 1
 
-        # NOT BEING USED
-        # margin = self.get_book_realized_value() + self.get_book_unrealized_value(
-        #     self.get_current_price()) - self.min_margin
-
-        # or self.position_time_step % 500 == 0
+        # PRINT SUMMARY
         if (session_expired and not self.last_session_printed) or (
                 (self.current_time_step % 500 == 0) and self.transactions.shape[0] > 0):
             self.print_transaction_summary2(session_expired)
 
-        info = 0
-        self.set_book_realized_value(self.get_book_realized_value())
+        # ************************************************
+        # FROM HERE BELOW WE BUILD THE REWARD + NEXT STATE
+        # ************************************************
 
-        if not self.is_current_pos_flat() and not self.done:
-            self.tran_unrlz_value.append(self.get_book_unrealized_value(self.get_current_price()))
+        # This holds all of the time step values
+        self.reward_steps = np.vstack((self.reward_steps, [self.balance, self.get_gross_unrealized_value()]))
+
+        reward = self.get_step_reward()
 
         ret_reward = reward + self.incentives
-        if self.normalize_return:
-            ret_reward = ret_reward / self.max_return_norm
+        # THIS WILL DOUBLE THE REWARD ON CLOSE
+        # if self.transaction_added:
+        #     tran_reward = self.transactions[-1, 9]
+        #     ret_reward += tran_reward
+        #     self.transaction_added = False
+        self.reward_total += ret_reward
+
+        # CAREFUL
+        # Here below we move the time step and give the next state back
+        # Important to make sure current time step is consistent with STATE from this point forward.
+        # *** ALL CALCULATIONS BELOW WILL BE FOR TIME STEP + 1***
+
+        # Move one time step
+        self.current_time_step += 1
+
+        # if shuffling per transaction we will check if we need to random select a current time step
+        # we need to do this prior to getting current state
+        if self.shuffle_per_tran_trigger:
+            self.current_time_step = self.get_shuffle_per_tran_current_time_step()
+            self.shuffle_per_tran_trigger = False
+        self.shuffle_per_tran_tt_counter += 1
+
+        # Retrieve current state for current time step
+        state = self.get_state()
+
+        # Info is set to zero
+        info = 0
 
         if self.done:
             self.episode_rewards = np.append(self.episode_rewards, self.get_tot_tran_pnl())
@@ -1114,20 +1575,7 @@ class TradingEnv(gym.Env):
             # self.plot_episode_returns()
             # self.plot_price_and_returns()
 
-        # Move one time step
-        self.current_time_step += 1
-
-        # Move inactive or position time step
-        if self.is_current_pos_flat():
-            self.inactive_time_step += 1
-        else:
-            self.position_time_step += 1
-
-        # This will fast forward the steps until we are in a positive exit position or until min loss
-        # threshold has been hit.
-        exit_unrlz = self.get_exit_unrlz_value()
-        if self.ff_on_loss and not self.done and not self.ff and not self.is_current_pos_flat() and exit_unrlz < 0:
-            return self.step_fast_forward()
+        # print("Pos:{}, Qty:{}, Balance:{:5.2f}, Tot Rewards:{:5.2f} ".format(self.get_current_pos_type(), self.get_current_pos_qty(), self.balance, self.reward_total))
 
         return state, ret_reward, self.done, info
 
@@ -1135,3 +1583,72 @@ class TradingEnv(gym.Env):
         # Renders the environment to the screen
         # This should replace the printing.
         print_nothing = True
+
+    def test_conciliation(self):
+        # LONG
+        self.step(1)
+        self.step(3)
+        self.step(1)
+        self.step(3)
+        self.step(1)
+        self.step(3)
+        self.step(1)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(0)
+        self.step(3)
+        self.step(3)
+        self.step(0)
+        self.step(3)
+        self.step(3)
+        self.step(0)
+        self.step(3)
+        self.step(3)
+        self.step(0)
+
+        # LONG
+        self.step(1)
+        self.step(1)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(2)
+
+        # SHORT
+        self.step(0)
+        self.step(3)
+        self.step(0)
+        self.step(3)
+        self.step(0)
+        self.step(3)
+        self.step(0)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(1)
+        self.step(3)
+        self.step(3)
+        self.step(1)
+        self.step(3)
+        self.step(3)
+        self.step(1)
+        self.step(3)
+        self.step(3)
+        self.step(1)
+
+        # SHORT
+        self.step(0)
+        self.step(0)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(3)
+        self.step(2)
