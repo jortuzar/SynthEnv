@@ -13,6 +13,7 @@ import curses
 from curseXcel import Table
 import torch
 import logging
+from datetime import datetime
 
 # FOR USE WITH CUPY
 # mempool = np.get_default_memory_pool()
@@ -80,6 +81,7 @@ class TradingEnv(gym.Env):
                  mask_flip_flop=False,
                  mask_flip_on_previous_loss=False,
                  mask_wall_value=1000,
+                 num_feature_headers=6,
                  data_file_path='C:/Users/jortu/Documents/1Syntheticks-AI/',
                  data_file_name='SI-09-20-FEATURELIST.json',
                  output_path='C:/Users/jortu/Documents/1Syntheticks-AI/',
@@ -260,7 +262,7 @@ class TradingEnv(gym.Env):
         self.num_featureList_features = self.featureList.shape[1]
         # Features included in the front of each row.
         # Last Price, Bid, Ask, Seconds left in session and Date Time.
-        self.num_feature_headers = 5
+        self.num_feature_headers = num_feature_headers
         # Features added by get_state()
         self.num_extra_features = 4
         self.num_features = self.num_featureList_features + self.num_extra_features - self.num_feature_headers
@@ -291,7 +293,7 @@ class TradingEnv(gym.Env):
             self.feature_info, self.price_info, self.scaler = self.set_and_save_scaler(self.featureList,
                                                                                        'scaler.pickle')
             self.max_time_steps = self.get_max_timesteps()
-            assert self.feature_info.shape[1] == self.num_features
+            assert self.feature_info.shape[1] + self.num_extra_features == self.num_features
 
         # SETUP CURSES FOR OUTPUT DISPLAY
 
@@ -321,29 +323,66 @@ class TradingEnv(gym.Env):
     #         stdscr.refresh()
     #         x = stdscr.getkey()
 
+    def get_step_for_date(self, step_date):
+        for i in range(self.featureList.shape[0]):
+            if str(int(self.featureList[i, 4])) == step_date and self.featureList[i, 5] == 0:
+                return i
+
+    def list_dates(self):
+        for i in range(self.featureList.shape[0]):
+            if self.featureList[i, 5] == 0:
+                print("Session Start -> " + str(int(self.featureList[i, 4]))[:8] + " - " + str(i))
+                logging.debug("Session Start -> " + str(int(self.featureList[i, 4]))[:8] + " - " + str(i))
+            elif self.featureList[i, 5] == 1:
+                print("Session End -> " + str(int(self.featureList[i, 4]))[:8] + " - " + str(i))
+                logging.debug("Session End -> " + str(int(self.featureList[i, 4]))[:8] + " - " + str(i))
+
     def validate_price_info(self):
         bid_count = 0
         ask_count = 0
+        equal_count = 0
         sum_bids = 0
         sum_asks = 0
         adj = 2
         print("Validating BID/ASK tick differences...")
         logging.debug("Validating BID/ASK tick differences...")
         for i in range(self.price_info.shape[0]):
-            bid_ticks = abs(self.price_info[i, 0] - self.price_info[i, 1]) / self.tick_size
-            ask_ticks = abs(self.price_info[i, 0] - self.price_info[i, 2]) / self.tick_size
-            if bid_ticks > adj:
-                self.price_info[i, 1] = self.price_info[i, 0] - adj * self.tick_size
-                sum_bids += bid_ticks
-                bid_count += 1
-                # print(abs(self.price_info[i, 0] - self.price_info[i, 1]) / self.tick_size)
-            if ask_ticks > adj:
-                self.price_info[i, 2] = self.price_info[i, 0] + adj * self.tick_size
-                sum_asks += ask_ticks
-                ask_count += 1
-                # print(abs(self.price_info[i, 0] - self.price_info[i, 2]) / self.tick_size)
-        print("bid_count {}".format(bid_count))
-        logging.debug("bid_count {}".format(bid_count))
+            if self.price_info[i, 0] == self.price_info[i, 1] == self.price_info[i, 2]:
+                if i >= self.price_info.shape[0] - 1:
+                    self.price_info[i, 1] = self.price_info[i, 0] - adj * self.tick_size
+                    self.price_info[i, 2] = self.price_info[i, 0] + adj * self.tick_size
+                else:
+                    posible_adjs = [0, 1, 2]
+                    bid_probs = [0, .4, .6]
+                    ask_probs = [0, .4, .6]
+                    if self.price_info[i+1, 0] > self.price_info[i, 0]:
+                        bid_probs = [.1, .5, .4]
+                    elif self.price_info[i+1, 0] < self.price_info[i, 0]:
+                        ask_probs = [.1, .5, .4]
+                    bid_adj = np.random.choice(posible_adjs, p=bid_probs)
+                    ask_adj = np.random.choice(posible_adjs, p=ask_probs)
+                    self.price_info[i, 1] = self.price_info[i, 0] - bid_adj * self.tick_size
+                    self.price_info[i, 2] = self.price_info[i, 0] + ask_adj * self.tick_size
+
+                equal_count += 1
+
+            else:
+                bid_ticks = abs(self.price_info[i, 0] - self.price_info[i, 1]) / self.tick_size
+                ask_ticks = abs(self.price_info[i, 0] - self.price_info[i, 2]) / self.tick_size
+                if bid_ticks > adj:
+                    self.price_info[i, 1] = self.price_info[i, 0] - adj * self.tick_size
+                    sum_bids += bid_ticks
+                    bid_count += 1
+                    # print(abs(self.price_info[i, 0] - self.price_info[i, 1]) / self.tick_size)
+                if ask_ticks > adj:
+                    self.price_info[i, 2] = self.price_info[i, 0] + adj * self.tick_size
+                    sum_asks += ask_ticks
+                    ask_count += 1
+                    # print(abs(self.price_info[i, 0] - self.price_info[i, 2]) / self.tick_size)
+        print("equal_count {}".format(equal_count))
+        logging.debug("equal_count {}".format(equal_count))
+        print("ask_count {}".format(ask_count))
+        logging.debug("ask_count {}".format(ask_count))
         print("ask_count {}".format(ask_count))
         logging.debug("ask_count {}".format(ask_count))
         if bid_count > 0:
@@ -377,13 +416,7 @@ class TradingEnv(gym.Env):
         else:
             return False
 
-    def get_valid_vector_mask(self):
-        # POSSIBLE ACTIONS
-        # 0 => short
-        # 1 => long
-        # 2 => close position
-        # 3 => do nothing or next step
-
+    def get_valid_vector_long_only(self):
         valid_mask = np.array([1, 1, 1, 1])
 
         assert(not self.is_current_pos_short())
@@ -393,13 +426,56 @@ class TradingEnv(gym.Env):
             valid_mask = np.array([0, 1, 0, 1])
         elif self.is_current_pos_long() and self.get_current_pos_qty() == self.position_max_qty:
             valid_mask = np.array([1, 0, 1, 1])
+
+        return valid_mask
+
+    def get_valid_vector_long_short_nothing(self):
+        valid_mask = np.array([1, 1, 1, 1])
+
+        # len(self.episode_rewards)
+        if self.is_current_pos_flat():
+            valid_mask = np.array([1, 1, 0, 1])
+        elif self.is_current_pos_long() and self.get_current_pos_qty() == self.position_max_qty:
+            valid_mask = np.array([1, 0, 1, 1])
         elif self.is_current_pos_short() and self.get_current_pos_qty() == self.position_max_qty:
             valid_mask = np.array([0, 1, 1, 1])
 
         return valid_mask
 
+    def get_valid_vector_long_short(self):
+        valid_mask = np.array([1, 1, 1, 1])
+
+        # len(self.episode_rewards)
+        if self.is_current_pos_flat():
+            valid_mask = np.array([1, 1, 0, 0])
+        elif self.is_current_pos_long() and self.get_current_pos_qty() == self.position_max_qty:
+            valid_mask = np.array([1, 0, 1, 1])
+        elif self.is_current_pos_short() and self.get_current_pos_qty() == self.position_max_qty:
+            valid_mask = np.array([0, 1, 1, 1])
+
+        return valid_mask
+
+    def get_valid_vector_mask(self):
+        # POSSIBLE ACTIONS
+        # 0 => short
+        # 1 => long
+        # 2 => close position
+        # 3 => do nothing or next step
+
+        valid_mask = self.get_valid_vector_long_only()
+        # valid_mask = self.get_valid_vector_long_short_nothing()
+        # valid_mask = self.get_valid_vector_long_short()
+
+        return valid_mask
+
+    def get_valid_vector_mask_probs(self):
+
+        ret = self.get_valid_vector_mask_probs_long_only()
+        # ret = self.get_valid_vector_mask_probs_long_short()
+
+        return ret
+
     def get_valid_mask(self):
-        assert(not self.is_current_pos_short())
         valid_mask = self.get_valid_vector_mask()
         valid_mask = valid_mask.astype(bool)
         valid_mask = np.invert(valid_mask)
@@ -407,7 +483,7 @@ class TradingEnv(gym.Env):
 
         return valid_mask
 
-    def get_valid_vector_mask_probs(self):
+    def get_valid_vector_mask_probs_long_only(self):
         valid_mask = self.get_valid_vector_mask()
         tot = np.sum(valid_mask)
         ret = []
@@ -420,6 +496,36 @@ class TradingEnv(gym.Env):
             valid_mask[1] = prob_long
             ret = valid_mask
         elif self.is_current_pos_long() and valid_mask[1] == 0 and valid_mask[3] == 1:
+            prob_do_nothing = 0.99
+            probs = (1 - prob_do_nothing) / (tot - 1)
+            valid_mask = valid_mask * probs
+            valid_mask[3] = prob_do_nothing
+            ret = valid_mask
+        else:
+            ret = valid_mask / tot
+
+        return ret
+
+    def get_valid_vector_mask_probs_long_short(self):
+        valid_mask = self.get_valid_vector_mask()
+        tot = np.sum(valid_mask)
+        ret = []
+        assert (tot > 0)
+
+        if self.is_current_pos_long() and valid_mask[1] == 1:
+            prob_long = 0.99
+            probs = (1 - prob_long) / (tot - 1)
+            valid_mask = valid_mask * probs
+            valid_mask[1] = prob_long
+            ret = valid_mask
+        elif self.is_current_pos_short() and valid_mask[0] == 1:
+            prob_short = 0.99
+            probs = (1 - prob_short) / (tot - 1)
+            valid_mask = valid_mask * probs
+            valid_mask[0] = prob_short
+            ret = valid_mask
+        elif (self.is_current_pos_long() and valid_mask[1] == 0 and valid_mask[3] == 1) or \
+             (self.is_current_pos_short() and valid_mask[0] == 0 and valid_mask[3] == 1):
             prob_do_nothing = 0.99
             probs = (1 - prob_do_nothing) / (tot - 1)
             valid_mask = valid_mask * probs
@@ -501,11 +607,15 @@ class TradingEnv(gym.Env):
         pickle.dump(scaler, open(self.output_path + scaler_name, 'wb'))
         return feature_info, price_info, scaler
 
-    def set_scaler_and_transform_features(self, scaler_name):
+    def set_scaler_and_transform_features(self, scaler_name, clip_after_transform=True):
         pickle_file = open(self.output_path + scaler_name, 'rb')
         self.scaler = pickle.load(pickle_file)
         pickle_file.close()
-        feature_info, price_info, scaler = norm_features(features=self.featureList, n_label_cols=self.num_feature_headers, test_scaler=self.scaler)
+        feature_info, price_info, scaler = norm_features(features=self.featureList,
+                                                         n_label_cols=self.num_feature_headers,
+                                                         test_scaler=self.scaler)
+        if clip_after_transform:
+            feature_info = np.clip(feature_info, a_min=0, a_max=1)
         self.feature_info = feature_info
         self.price_info = price_info
 
@@ -514,6 +624,13 @@ class TradingEnv(gym.Env):
 
     def sample(self):
         return self.np_random.randint(self.num_actions)
+
+    def get_features_start_end_dates(self):
+        start = str(int(self.featureList[0, 4]))
+        end = str(int(self.featureList[-1, 4]))
+        start_date = datetime.strptime(start, '%Y%m%d%H%M%S')
+        end_date = datetime.strptime(end, '%Y%m%d%H%M%S')
+        return "Start Date: {}, End Date:{}".format(start_date, end_date)
 
     def load_feature_list(self, file_path=None):
         if file_path.find('.zip') >= 0 or file_path.find('.json') >= 0:
